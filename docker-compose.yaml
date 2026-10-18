@@ -1,0 +1,31 @@
+
+services:
+  bridge:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      PORT: "20129"
+      HOST: "0.0.0.0"
+      OPENCODE_CACHE_DIR: /data/cache
+      AUTO_UPDATE: "1"
+    volumes:
+      - bridge-cache:/data/cache
+    expose:
+      - "20129"
+    healthcheck:
+      test:
+        - CMD
+        - bun
+        - -e
+        - "fetch('http://127.0.0.1:20129/health').then(r => { if (!r.ok) process.exit(1) }).catch(() => process.exit(1))"
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  bridge-cache:
