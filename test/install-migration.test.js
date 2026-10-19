@@ -45,6 +45,28 @@ test("installer fetches every file the runtime needs", () => {
   }
 });
 
+test("installer ships tunnel-doctor.sh, and validates it before swapping files", () => {
+  if (!hasInstaller()) return;
+  const src = fs.readFileSync(INSTALLER, "utf8");
+  // A file that is committed but never fetched is invisible to every install
+  // made with the one-liner, which is how tunnel-doctor.sh first shipped.
+  assert.match(src, /fetch tunnel-doctor\.sh/, "installer does not fetch tunnel-doctor.sh");
+  assert.match(
+    src,
+    /mv -f "\$STAGE\/\$file" "\$BINDIR\/\$file"[\s\S]*tunnel-doctor\.sh|tunnel-doctor\.sh; do[\s\S]*mv -f/,
+    "tunnel-doctor.sh is fetched but never moved into BINDIR"
+  );
+  assert.match(src, /chmod \+x[^\n]*tunnel-doctor\.sh/, "tunnel-doctor.sh is installed without the execute bit");
+  // `new Function` cannot parse bash; only `bash -n` can, and it must run
+  // before the running bridge is stopped. Compare against the *call* site:
+  // indexOf("stop_own_bridge") would find the function definition at line 255.
+  const syntaxAt = src.indexOf("bash -n");
+  const stopAt = src.indexOf("\nstop_own_bridge\n");
+  assert.ok(syntaxAt > -1, "installer never syntax-checks tunnel-doctor.sh");
+  assert.ok(stopAt > -1, "installer never calls stop_own_bridge");
+  assert.ok(syntaxAt < stopAt, "tunnel-doctor.sh must be validated before the old bridge is stopped");
+});
+
 test("installer backs up an existing install before overwriting", () => {
   if (!hasInstaller()) return;
   const src = fs.readFileSync(INSTALLER, "utf8");
@@ -251,6 +273,32 @@ test("self-updater in server.js parses JS and JSON in-process instead of spawnin
     if (prevAuto === undefined) delete process.env.AUTO_UPDATE;
     else process.env.AUTO_UPDATE = prevAuto;
     srv.__setLastUpdateCheck(Date.now());
+  }
+});
+
+test("every shipped file reaches installed hosts through both delivery paths", () => {
+  const root = path.join(__dirname, "..");
+  const pkg = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
+  const serverSrc = fs.readFileSync(path.join(root, "server.js"), "utf8");
+  const installSrc = fs.readFileSync(path.join(root, "install.sh"), "utf8");
+
+  const updateBlock = serverSrc.match(/const UPDATE_FILES = \[([\s\S]*?)\];/);
+  assert.ok(updateBlock, "server.js has no UPDATE_FILES list");
+  const updateFiles = [...updateBlock[1].matchAll(/"([^"]+)"/g)].map((m) => m[1]);
+
+  // These are the runtime files an installed bridge needs. A file that is in
+  // package.json but in neither delivery path ships to nobody, which is how
+  // tunnel-doctor.sh was committed yet missing from every host in the fleet.
+  const runtime = pkg.files.filter((f) => f !== "README.md" && f !== "AGENTS.md" && f !== "install.sh");
+  for (const f of runtime) {
+    assert.ok(updateFiles.includes(f), `${f} is in package.json files but not in UPDATE_FILES`);
+    assert.ok(installSrc.includes(f), `${f} is in package.json files but install.sh never fetches it`);
+  }
+
+  // A .sh entry is useless without a parser that understands it.
+  if (updateFiles.some((f) => f.endsWith(".sh"))) {
+    assert.match(serverSrc, /bash", \["-n"/, "self-updater fetches a shell script but never runs bash -n on it");
+    assert.match(serverSrc, /chmodSync\(tmpPath, 0o755\)/, "self-updater does not mark the shell script executable");
   }
 });
 

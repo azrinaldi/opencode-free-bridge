@@ -151,7 +151,7 @@ if [ -n "$PREV_VERSION" ]; then
   say "Found existing install: v$PREV_VERSION in $BINDIR"
   BACKUP="$BINDIR/.backup-v$PREV_VERSION-$(date +%Y%m%d%H%M%S)"
   mkdir -p "$BACKUP"
-  for f in server.js identity.js token-budget.js verify.js gate-drill.js transport-fingerprint.js transport-baseline.json package.json; do
+  for f in server.js identity.js token-budget.js verify.js gate-drill.js transport-fingerprint.js transport-baseline.json package.json tunnel-doctor.sh; do
     [ -f "$BINDIR/$f" ] && cp -p "$BINDIR/$f" "$BACKUP/$f" 2>/dev/null || true
   done
   say "Backed up to $BACKUP"
@@ -359,6 +359,7 @@ fetch verify.js
 fetch gate-drill.js
 fetch transport-fingerprint.js
 fetch transport-baseline.json
+fetch tunnel-doctor.sh
 
 # A syntactically broken release must never replace a working install.
 #
@@ -381,6 +382,13 @@ for json in package.json transport-baseline.json; do
   "$RUNTIME" -e 'JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"))' "$STAGE/$json" \
     || die "$json is not valid JSON; the running bridge was left untouched"
 done
+# tunnel-doctor.sh is bash, not JS, so `new Function` cannot check it. `bash -n`
+# parses without executing, which is exactly the guarantee we need here.
+if [ -f "$STAGE/tunnel-doctor.sh" ]; then
+  if command -v bash >/dev/null 2>&1; then
+    bash -n "$STAGE/tunnel-doctor.sh" || die "tunnel-doctor.sh failed a syntax check; the running bridge was left untouched"
+  fi
+fi
 
 # Staged and validated. Only now is it safe to stop the old bridge.
 retire_legacy_service
@@ -398,10 +406,10 @@ if [ -n "$(port_holder)" ]; then
   die "cannot bind port $PORT"
 fi
 
-for file in package.json server.js identity.js token-budget.js verify.js gate-drill.js transport-fingerprint.js transport-baseline.json; do
-  mv -f "$STAGE/$file" "$BINDIR/$file"
+for file in package.json server.js identity.js token-budget.js verify.js gate-drill.js transport-fingerprint.js transport-baseline.json tunnel-doctor.sh; do
+  [ -f "$STAGE/$file" ] && mv -f "$STAGE/$file" "$BINDIR/$file"
 done
-chmod +x "$BINDIR/server.js" "$BINDIR/identity.js" "$BINDIR/verify.js" "$BINDIR/gate-drill.js" "$BINDIR/transport-fingerprint.js" 2>/dev/null || true
+chmod +x "$BINDIR/server.js" "$BINDIR/identity.js" "$BINDIR/verify.js" "$BINDIR/gate-drill.js" "$BINDIR/transport-fingerprint.js" "$BINDIR/tunnel-doctor.sh" 2>/dev/null || true
 say "Files installed (v$("$RUNTIME" -e 'try{process.stdout.write(require(process.argv[1]).version||"latest")}catch{process.stdout.write("latest")}' "$BINDIR/package.json" 2>/dev/null || echo 'latest'))"
 
 # ---------------------------------------------------------------- service ---

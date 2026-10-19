@@ -104,6 +104,46 @@ If the user has another machine or VPS running `opencode-free-bridge` on port `2
 ssh -N -L 127.0.0.1:20130:127.0.0.1:20129 user@remote-vps
 ```
 
+For a **reverse** tunnel (`-R`, the sending host dials out to the host that runs the router), run it as a systemd unit so it survives a reboot, and point `-i` at a key that actually exists on that host:
+
+```ini
+[Service]
+ExecStart=/usr/bin/ssh -NT -o BatchMode=yes -o ServerAliveInterval=15 \
+  -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes \
+  -i /root/.ssh/id_vps_master -p 48222 \
+  -R 127.0.0.1:20136:127.0.0.1:20129 root@router-host
+Restart=always
+RestartSec=5
+```
+
+#### Stale forwards after an unclean disconnect
+
+A reverse tunnel is held open by an `sshd-session` on the **receiving** host. When the sending host reboots or loses power, the TCP connection dies without a FIN and the receiving sshd keeps the listening socket until it notices. A replacement tunnel then fails with:
+
+```
+Error: remote port forwarding failed for listen port 20136
+```
+
+The default `ClientAliveInterval 300` × `ClientAliveCountMax 2` leaves that window at **ten minutes**. Two fixes, both worth having:
+
+1. **Tighten the keepalive** on the receiving host. OpenSSH uses the **first** value it reads, so the drop-in must sort *before* any existing one:
+
+   ```bash
+   # /etc/ssh/sshd_config.d/00-keepalive.conf   (note the 00- prefix)
+   ClientAliveInterval 30
+   ClientAliveCountMax 4      # dead peer detected after 120s
+   ```
+
+   Verify with `sshd -T | grep -i clientalive`, then `systemctl reload ssh`.
+
+2. **Reap the stale session** when it has already happened. `tunnel-doctor.sh` (shipped in this repo) distinguishes a *live* forward from a stale one by checking whether the sshd session holding the listener still has an established transport — a listener alone proves nothing:
+
+   ```bash
+   ./tunnel-doctor.sh                 # report
+   ./tunnel-doctor.sh --reap          # kill sessions with no transport
+   ./tunnel-doctor.sh --check         # audit the keepalive window
+   ```
+
 ---
 
 ## 4. Troubleshooting Guide for Agents
@@ -113,7 +153,7 @@ When a user reports an error, diagnose it using this decision table before chang
 | Symptom | Root Cause | Action to Take |
 |---|---|---|
 | `node server.js` exits with `opencode-free-bridge requires Bun` | Server was launched with Node.js instead of Bun | Launch with `bun server.js` (or run `bash install.sh` to rewrite the systemd/launchd service unit to use `bun`). |
-| `HTTP 403 FreeTierError` returned to client **after** logs show `refreshing identity and retrying once with full tool set` or `skipping retry because a full-shape retry already failed <30s ago` (and `verify.js` exits `2` with `GATE`) | Upstream per-IP free-tier quota is temporarily exhausted on this network | **Do not modify headers or code.** Confirm by running `bun gate-drill.js`: if `upstream control` says `HTTP 403 -> gate CLOSED`, the IP itself is throttled by `opencode.ai` (the official `opencode` CLI binary fails with the exact same 403 on this IP). The bridge automatically suppresses duplicate 403 retries and forced GitHub refreshes for 30s (`GATE_RETRY_COOLDOWN_MS`, `GATE_REFRESH_COOLDOWN_MS`) so it does not extend the IP penalty. Wait for cooldown or use another IP/VPS tunnel. |
+| `HTTP 403 FreeTierError` returned to client **after** logs show `refreshing identity and retrying once with full tool set` or `skipping retry because a full-shape retry already failed <30s ago` (and `verify.js` exits `2` with `GATE`) | **Two distinct causes, one indistinguishable upstream message.** Read the log tail: it now ends with either *"the request carried every anchor the gate checks, so this is the egress"* or *"this bridge produced a shape the gate refuses — missing …"*. The second is a bridge bug, not a quota problem. | **First read the verdict in the log line.** If it says the shape was complete, the egress is refused: do not modify headers or code, run `bun gate-drill.js` and check `upstream control` (`HTTP 403 -> gate CLOSED` means this IP is refused; the official `opencode` CLI fails identically from it). If it names missing anchors, the derived recipe/tool profile lost one — inspect `/health` → `identity.gate.anchors` and `identity.gate.lastRejection`. The bridge suppresses duplicate 403 retries and forced GitHub refreshes for 30s (`GATE_RETRY_COOLDOWN_MS`, `GATE_REFRESH_COOLDOWN_MS`) so it does not extend an IP penalty. |
 | `verify.js` exits `1` with `TLS fingerprint drift detected` or `Server is running on Node.js` | The runtime's TLS `ClientHello` does not match `transport-baseline.json` | Run `bun transport-fingerprint.js --check` to inspect cipher/extension differences, and ensure the service runs under a current Bun 1.4+ binary. |
 | `bun: command not found` in a fresh SSH session, but the service is healthy | `bun.sh/install` only edits an interactive shell's PATH | Use the absolute path (`~/.bun/bin/bun`) or export `PATH="$HOME/.bun/bin:$PATH"`. Do not reinstall. |
 | `HTTP 429` or `BUSY` in `verify.js` | Upstream model capacity limit | Switch to another model ID from `GET /v1/models`. |

@@ -608,6 +608,51 @@ describe("identity: self-healing on gate rejection", () => {
     assert.equal(second.cooldown, true);
     assert.equal(calls.length, countAfterFirst, "must not re-fetch GitHub/catalog during 403 cooldown");
   });
+
+  it("memoizes extracted source by release SHA on forced refresh and persists source-recipe.json to disk", async () => {
+    const fs = require("node:fs");
+    const os = require("node:os");
+    const path = require("node:path");
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "ofb-src-cache-"));
+    const prevCacheDir = process.env.OPENCODE_CACHE_DIR;
+    process.env.OPENCODE_CACHE_DIR = tmpDir;
+    try {
+      const calls = mockUpstream({ versions: ["2.0.32"] });
+      await identity.refresh({ force: true });
+      const afterFirst = calls.length;
+      assert.ok(calls.some((u) => u.includes("raw.githubusercontent.com")));
+
+      // Even when cooldown is cleared and local session prefix is corrupted,
+      // forced refresh at the same SHA heals from memoized source without
+      // re-downloading raw.githubusercontent.com files.
+      identity.__setSessionPrefix("bad_");
+      const verdict = await identity.onGateRejection(403, "FreeTierError", "free tier");
+      assert.equal(verdict.retry, true);
+      assert.equal(identity.getSessionPrefix(), "ses_");
+      const secondCalls = calls.slice(afterFirst);
+      assert.equal(
+        secondCalls.filter((u) => u.includes("raw.githubusercontent.com")).length,
+        0,
+        "must not re-fetch raw.githubusercontent.com files for the same commit SHA"
+      );
+
+      // Disk cache round-trip for source-recipe.json
+      const sha = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
+      const extracted = {
+        sessionPrefix: "ses_",
+        sessionLength: 26,
+        tools: { read: identity.DEFAULT_TOOLS.read, shell: identity.DEFAULT_TOOLS.shell },
+        toolNames: ["read", "shell"],
+      };
+      identity.writeCachedSource(sha, extracted);
+      assert.equal(identity.readCachedSource(sha)?.ref, sha);
+      assert.equal(identity.readCachedSource("other-sha"), null);
+    } finally {
+      if (prevCacheDir === undefined) delete process.env.OPENCODE_CACHE_DIR;
+      else process.env.OPENCODE_CACHE_DIR = prevCacheDir;
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("identity: adaptive endpoints", () => {
@@ -691,7 +736,15 @@ describe("identity: gate header wiring", () => {
       userAgent: "opencode/latest/2.0.32/cli",
       sessionId: "ses_abc",
     });
-    assert.deepEqual(Object.keys(headers).sort(), ["User-Agent", "x-session-id"]);
+    // One canonical spelling per name, whatever case the recipe used. The gate
+    // anchors are pinned on top of the recipe (see GATE_ANCHOR_HEADER_NAMES),
+    // so the recipe's own names are asserted as a subset rather than a fixed
+    // list — the invariant under test is de-duplication, not the anchor set.
+    const keys = Object.keys(headers);
+    assert.equal(keys.filter((k) => k.toLowerCase() === "user-agent").length, 1);
+    assert.equal(keys.filter((k) => k.toLowerCase() === "x-session-id").length, 1);
+    assert.ok(keys.includes("User-Agent"));
+    assert.ok(keys.includes("x-session-id"));
   });
 });
 

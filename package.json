@@ -1,6 +1,6 @@
 {
   "name": "opencode-free-bridge",
-  "version": "2.0.0",
+  "version": "2.0.2",
   "description": "OpenAI-compatible bridge to OpenCode free-tier models (no account required), self-adapting to gate changes",
   "main": "server.js",
   "bin": {
@@ -31,7 +31,8 @@
     "AGENTS.md",
     "install.sh",
     "transport-fingerprint.js",
-    "transport-baseline.json"
+    "transport-baseline.json",
+    "tunnel-doctor.sh"
   ],
   "keywords": [
     "opencode",

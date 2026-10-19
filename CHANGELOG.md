@@ -1,5 +1,29 @@
 # Changelog
 
+## [2.0.1] — 2026-10-18
+
+### Tunnel lifecycle tooling actually reaches installed hosts
+
+`tunnel-doctor.sh` was added in 2.0.0 but no delivery path carried it: it was
+absent from `install.sh` (fetch, move, backup, `chmod`), absent from the
+self-updater's `UPDATE_FILES`, and absent from the npm `files` list. A fresh
+one-liner install and an auto-update both produced a bridge without it, while
+`AGENTS.md` and `README.md` told operators to run it.
+
+#### Delivery (`install.sh`, `server.js`, `package.json`)
+- **Installer:** fetches `tunnel-doctor.sh`, validates it with `bash -n` before the running bridge is stopped, moves it into `BINDIR`, marks it executable, and includes it in the pre-upgrade backup.
+- **Self-updater:** `tunnel-doctor.sh` is in `UPDATE_FILES`. Because `new Function` cannot parse bash, the updater checks the shebang, then runs `bash -n` on the staged temp file, and applies mode `0755`. A host without bash is not treated as a syntax failure.
+- **npm `files`:** the script ships in the published tarball.
+
+#### Correctness (`tunnel-doctor.sh`)
+- **Default port scan widened to `20120-20149`.** The previous hardcoded `20129-20135` list silently omitted a newly added node's tunnel on `20136` — the exact failure the script exists to catch. Narrow it with `TUNNEL_PORTS="20129 20136"`.
+- **No-bash guard in the updater:** the earlier code removed the staged file before `chmod`, so a host without bash would fail the update instead of skipping the parse.
+
+#### Documentation
+- `README.md`: test count corrected (121 → 137), the stale-forward symptom and the `00-` prefix ordering rule for sshd keepalive drop-ins documented, and the installer's validation step now mentions `bash -n`.
+
+---
+
 ## [2.0.0] — 2026-10-18
 
 ### Adaptive OpenCode CLI Synchronization & Bun Transport Parity

@@ -49,6 +49,7 @@ const UPDATE_FILES = [
   "gate-drill.js",
   "transport-fingerprint.js",
   "transport-baseline.json",
+  "tunnel-doctor.sh",
   "server.js",
 ];
 let updateInFlight = null;
@@ -131,9 +132,33 @@ async function checkAndApplyUpdate() {
           } catch (err) {
             throw new Error(`invalid JSON in ${file}: ${err.message}`);
           }
+        } else if (file.endsWith(".sh")) {
+          // `new Function` cannot parse bash. Check the shebang here and let
+          // `bash -n` parse it below, once it is on disk.
+          if (!/^#!.*\b(ba)?sh\b/.test(text)) throw new Error(`${file} is not a shell script`);
         }
         const tmpPath = path.join(__dirname, `.${file}.tmp.${process.pid}`);
         fs.writeFileSync(tmpPath, text, "utf8");
+        if (file.endsWith(".sh")) {
+          let parsed = true;
+          try {
+            require("child_process").execFileSync("bash", ["-n", tmpPath], {
+              stdio: "ignore",
+              timeout: 5000,
+            });
+          } catch (err) {
+            // No bash on this host is not a syntax failure; the shebang check
+            // above is all we can do there. Anything else is a real rejection.
+            if (!err || err.code !== "ENOENT") {
+              try {
+                fs.unlinkSync(tmpPath);
+              } catch {}
+              parsed = false;
+              throw new Error(`syntax check failed for ${file}: ${err.message}`);
+            }
+          }
+          if (parsed) fs.chmodSync(tmpPath, 0o755);
+        }
         tmpFiles.push({ tmpPath, targetPath: path.join(__dirname, file) });
       }
       for (const { tmpPath, targetPath } of tmpFiles) fs.renameSync(tmpPath, targetPath);
@@ -209,6 +234,37 @@ function isValidV2UserAgent(ua) {
     .trim()
     .match(/^opencode\/[a-z0-9-]+\/(\d+)\.\d+\.\d+\/[a-z0-9-]+$/i);
   return Boolean(match) && parseInt(match[1], 10) >= 2;
+}
+
+/**
+ * A User-Agent the free-tier gate accepts, or the identity's own.
+ *
+ * Measured (clean egress, `read` tool present): a request without a
+ * `User-Agent`, with a bare `opencode`, or with `Mozilla/5.0 …` / `curl/8.18.0`
+ * is refused with the same 403 FreeTierError that a blocked IP gets. Only the
+ * `opencode/<channel>/<semver>/<name>` shape passes, and the version is not
+ * checked for freshness (`opencode/9.9.9` was accepted).
+ *
+ * `OPENCODE_USER_AGENT` is an operator override, so it is honoured — but an
+ * override that the gate would reject is reported instead of silently
+ * producing a 403 that looks like an allowance problem.
+ */
+function gateSafeUserAgent() {
+  const override = process.env.OPENCODE_USER_AGENT;
+  if (override && /^opencode\/[A-Za-z0-9-]+\/\d+\.\d+\.\d+\/[A-Za-z0-9-]+$/i.test(String(override).trim())) {
+    return String(override).trim();
+  }
+  if (override) {
+    console.warn(
+      "[opencode-free-bridge] OPENCODE_USER_AGENT does not match the shape the free-tier gate accepts " +
+        "(opencode/<channel>/<semver>/<name>); using the derived identity instead"
+    );
+  }
+  const derived = syncUserAgent();
+  if (/^opencode\//i.test(derived)) return derived;
+  // Last resort: the derived identity itself is malformed. Keep the request
+  // shaped as an opencode client rather than sending something the gate refuses.
+  return "opencode/latest/0.0.0/cli";
 }
 
 // --- ID Generator (matches OpenCode v2 CLI format) ---
@@ -463,6 +519,37 @@ function stableStringify(val) {
 }
 
 const EMPTY_MAP = Object.freeze(new Map());
+const paramSigCache = new WeakMap();
+function getParamSig(params) {
+  if (!params || typeof params !== "object") return stableStringify(params);
+  let sig = paramSigCache.get(params);
+  if (sig === undefined) {
+    sig = stableStringify(params);
+    paramSigCache.set(params, sig);
+  }
+  return sig;
+}
+
+function buildIpThrottleHeaders(freeTierMsg, diagnostic = null) {
+  if (!freeTierMsg) return { "Content-Type": "application/json" };
+  const retryAfterSec = Math.max(1, Math.ceil((GATE_RETRY_COOLDOWN_MS || 30000) / 1000));
+  const headers = {
+    "Content-Type": "application/json",
+    "Retry-After": String(retryAfterSec),
+    // `shape-ok` means the request carried every anchor the gate checks, so the
+    // refusal is about this egress. `shape-rejected` means the bridge produced
+    // a request the gate refuses — a bridge bug that returns the identical
+    // upstream error. Callers that alert on this can tell the two apart.
+    "X-OpenCode-Gate": diagnostic && diagnostic.shapeOk === false ? "shape-rejected" : "ip-throttled",
+  };
+  if (diagnostic && diagnostic.logId) headers["X-OpenCode-Log-Id"] = diagnostic.logId;
+  return headers;
+}
+
+function resolveIpThrottleStatus(upstreamStatus, freeTierMsg) {
+  if (freeTierMsg && process.env.IP_LIMIT_STATUS === "429") return 429;
+  return upstreamStatus;
+}
 
 /**
  * Is this client-supplied tool already byte-identical to the fingerprint we
@@ -474,7 +561,7 @@ function isExactFingerprintDef(tool, key) {
   const def = tool.function && typeof tool.function === "object" ? tool.function : tool;
   return (
     def.description === want.description &&
-    stableStringify(def.parameters) === stableStringify(want.parameters)
+    getParamSig(def.parameters) === getParamSig(want.parameters)
   );
 }
 
@@ -945,7 +1032,7 @@ function getProjectId() {
 
 function buildUpstreamHeaders(req, sessionId) {
   const downstreamUa = req?.headers?.["user-agent"] || "";
-  const ua = isValidV2UserAgent(downstreamUa) ? downstreamUa : currentUserAgent;
+  const ua = isValidV2UserAgent(downstreamUa) ? downstreamUa : gateSafeUserAgent();
   const client = req?.headers?.["x-opencode-client"];
   // `x-opencode-project` is not a constant: the CLI derives it as
   // `sha1("git-remote:" + host + path)` for a repo, `sha1("directory:" + path)`
@@ -1023,10 +1110,44 @@ const MAX_SESSIONS = 500;
 const SESSION_TTL_MS = 3 * 3600 * 1000;
 let lastFailedGateRetryTime = 0;
 let lastFailedGateRetryEpoch = -1;
+// The last gate rejection's correlation id and the shape audit that was true
+// when it happened. `x-opencode-log-id` is the only handle upstream gives for
+// a rejected request, so it is recorded rather than discarded — it is what a
+// support request or a bug report needs to be actionable.
+let lastGateDiagnostic = null;
+let lastUpstreamError = null;
+
+/**
+ * Which gate anchors the *actual* outgoing request carried.
+ *
+ * The gate requires a tool named `read` and an `opencode/*` User-Agent with a
+ * session header (see GATE_ANCHOR_TOOL_NAMES / GATE_ANCHOR_HEADER_NAMES in
+ * identity.js). When a 403 comes back, these are what distinguishes "this
+ * bridge sent an unacceptable shape" from "upstream refuses this egress".
+ * Reporting the distinction is the whole point: both produce an identical
+ * FreeTierError body.
+ */
+function auditGateShape(upstreamBody, headers) {
+  const tools = Array.isArray(upstreamBody?.tools) ? upstreamBody.tools : [];
+  const toolNames = tools.map((t) => t?.function?.name || t?.name).filter(Boolean);
+  const ua = String(headers?.["User-Agent"] || "");
+  const sessionHeaders = ["x-opencode-session", "x-session-affinity", "x-session-id"].filter(
+    (h) => headers?.[h]
+  );
+  return {
+    hasReadTool: toolNames.includes("read"),
+    toolCount: toolNames.length,
+    userAgentOk: /^opencode\/[A-Za-z0-9-]+\/\d+\.\d+\.\d+\/[A-Za-z0-9-]+$/i.test(ua),
+    userAgent: ua,
+    sessionHeaders,
+  };
+}
+
 const origSessionCacheClear = sessionCache.clear.bind(sessionCache);
 sessionCache.clear = () => {
   lastFailedGateRetryTime = 0;
   lastFailedGateRetryEpoch = -1;
+  lastUpstreamError = null;
   return origSessionCacheClear();
 };
 
@@ -1228,6 +1349,32 @@ function handleRequest(req, res) {
           endpoints: idState.endpoints,
           toolNames: idState.toolNames,
           tools: idState.tools,
+          gate: {
+            status:
+              lastFailedGateRetryTime > 0 &&
+              Date.now() - lastFailedGateRetryTime < GATE_RETRY_COOLDOWN_MS &&
+              lastFailedGateRetryEpoch === (idState.epoch || 0)
+                ? "throttled"
+                : "open",
+            throttledUntil:
+              lastFailedGateRetryTime > 0 &&
+              Date.now() - lastFailedGateRetryTime < GATE_RETRY_COOLDOWN_MS &&
+              lastFailedGateRetryEpoch === (idState.epoch || 0)
+                ? lastFailedGateRetryTime + GATE_RETRY_COOLDOWN_MS
+                : null,
+            cooldownMs: GATE_RETRY_COOLDOWN_MS,
+            // The shape anchors the gate checks. Reported so a deployment can
+            // confirm it is sending them without waiting for a 403.
+            anchors: {
+              tools: identity.GATE_ANCHOR_TOOL_NAMES.slice(),
+              headers: identity.GATE_ANCHOR_HEADER_NAMES.slice(),
+            },
+            // The most recent gate rejection: what was sent, what was missing,
+            // and upstream's own correlation id. `shapeOk: false` means the
+            // bridge produced a request the gate refuses — not an IP problem.
+            lastRejection: lastGateDiagnostic,
+            lastUpstreamError,
+          },
         },
       })
     );
@@ -1365,6 +1512,7 @@ function handleRequest(req, res) {
 
       let useResponses = isResponsesModel(targetModel);
       const sessionId = getPersistentSessionId(req, body);
+      let retryHeaders = null;
       const upstreamHeaders = buildUpstreamHeaders(req, sessionId);
 
       const abortController = new AbortController();
@@ -1466,24 +1614,54 @@ function handleRequest(req, res) {
           const modelLevelError = /model(deprecated|unavailable|protocolunsupported)/i.test(
             moveErrType
           );
-          await identity.refresh({ force: true }).catch(() => null);
-          liveEndpoints = resolveEndpoints(targetModel);
-          const derivedUrl = useResponses ? liveEndpoints.responsesUrl : liveEndpoints.chatUrl;
-          if (!modelLevelError && derivedUrl && derivedUrl !== staleUrl) {
-            console.warn(
-              `[opencode-free-bridge] Upstream endpoint moved (${upstreamRes.status}): ${staleUrl} → ${derivedUrl}; retrying once`
-            );
-            upstreamUrl = derivedUrl;
-            upstreamRes = await fetch(upstreamUrl, {
-              method: "POST",
-              headers: upstreamHeaders,
-              body: JSON.stringify(upstreamBody),
-              signal: abortController.signal,
-            });
-            // The text above belonged to the response we just replaced. Reading
-            // it for the new response would report the old error verbatim.
-            consumedErrorText = null;
+          if (!modelLevelError) {
+            await identity.refresh({ force: true }).catch(() => null);
+            liveEndpoints = resolveEndpoints(targetModel);
+            const derivedUrl = useResponses ? liveEndpoints.responsesUrl : liveEndpoints.chatUrl;
+            if (derivedUrl && derivedUrl !== staleUrl) {
+              console.warn(
+                `[opencode-free-bridge] Upstream endpoint moved (${upstreamRes.status}): ${staleUrl} → ${derivedUrl}; retrying once`
+              );
+              upstreamUrl = derivedUrl;
+              upstreamRes = await fetch(upstreamUrl, {
+                method: "POST",
+                headers: upstreamHeaders,
+                body: JSON.stringify(upstreamBody),
+                signal: abortController.signal,
+              });
+              // The text above belonged to the response we just replaced. Reading
+              // it for the new response would report the old error verbatim.
+              consumedErrorText = null;
+            }
           }
+        }
+
+        // Transient 5xx self-heal: upstream Workers intermittently drop empty-body
+        // HTTP 500/502/503/504 responses (e.g. cf-placement: remote-IAD) during
+        // free-inference degradation. Retry once with fresh trace/session headers.
+        if (!upstreamRes.ok && upstreamRes.status >= 500 && upstreamRes.status < 600) {
+          const first5xx = upstreamRes.status;
+          const firstLogId =
+            typeof upstreamRes.headers?.get === "function"
+              ? upstreamRes.headers.get("x-opencode-log-id")
+              : null;
+          try {
+            await upstreamRes.text();
+          } catch {}
+          const retry5xxSid = regenerateSessionId(req, body, sessionId);
+          const retry5xxHeaders = buildUpstreamHeaders(req, retry5xxSid);
+          console.warn(
+            `[opencode-free-bridge] Upstream returned ${first5xx}` +
+              (firstLogId ? ` [x-opencode-log-id: ${firstLogId}]` : "") +
+              `; retrying once with fresh session`
+          );
+          upstreamRes = await fetch(upstreamUrl, {
+            method: "POST",
+            headers: retry5xxHeaders,
+            body: JSON.stringify(upstreamBody),
+            signal: abortController.signal,
+          });
+          consumedErrorText = null;
         }
 
         // Self-healing identity. A gate rejection is identified by the error
@@ -1514,13 +1692,46 @@ function handleRequest(req, res) {
             `Upstream error ${upstreamRes.status}`;
 
           if (!isFreeTierCliGateError(upstreamRes.status, errType, rawMsg)) {
-            res.writeHead(upstreamRes.status, { "Content-Type": "application/json" });
+            const upstreamLogId =
+              typeof upstreamRes.headers?.get === "function"
+                ? upstreamRes.headers.get("x-opencode-log-id")
+                : null;
+            const cfRay =
+              typeof upstreamRes.headers?.get === "function"
+                ? upstreamRes.headers.get("cf-ray")
+                : null;
+            const cfPlacement =
+              typeof upstreamRes.headers?.get === "function"
+                ? upstreamRes.headers.get("cf-placement")
+                : null;
+            if (upstreamRes.status >= 500) {
+              lastUpstreamError = {
+                at: Date.now(),
+                status: upstreamRes.status,
+                logId: upstreamLogId,
+                cfRay,
+                cfPlacement,
+                message: rawMsg,
+                model: targetModel,
+              };
+              console.warn(
+                `[opencode-free-bridge] Upstream server error (${upstreamRes.status}) on model ${targetModel}: ${rawMsg}` +
+                  (upstreamLogId ? ` [x-opencode-log-id: ${upstreamLogId}]` : "") +
+                  (cfRay ? ` [cf-ray: ${cfRay}]` : "") +
+                  (cfPlacement ? ` [cf-placement: ${cfPlacement}]` : "")
+              );
+            }
+            const errHeaders = { "Content-Type": "application/json" };
+            if (upstreamLogId) errHeaders["X-OpenCode-Log-Id"] = upstreamLogId;
+            if (upstreamRes.status >= 500) errHeaders["X-OpenCode-Gate"] = "upstream-error";
+            res.writeHead(upstreamRes.status, errHeaders);
             return res.end(
               JSON.stringify({
                 error: {
                   message: rawMsg,
                   type: errType || "upstream_error",
                   code: upstreamRes.status,
+                  ...(upstreamLogId ? { log_id: upstreamLogId } : {}),
                 },
               })
             );
@@ -1567,9 +1778,10 @@ function handleRequest(req, res) {
             // new URL — reusing the pre-refresh value would defeat the derivation.
             liveEndpoints = resolveEndpoints(targetModel);
             upstreamUrl = useResponses ? liveEndpoints.responsesUrl : liveEndpoints.chatUrl;
+            retryHeaders = buildUpstreamHeaders(req, retrySessionId);
             upstreamRes = await fetch(upstreamUrl, {
               method: "POST",
-              headers: buildUpstreamHeaders(req, retrySessionId),
+              headers: retryHeaders,
               body: JSON.stringify(upstreamBody),
               signal: abortController.signal,
             });
@@ -1635,20 +1847,59 @@ function handleRequest(req, res) {
               lastFailedGateRetryTime = Date.now();
               lastFailedGateRetryEpoch = identity.getState().epoch || 0;
             }
+
+            // The gate answers the same `403 FreeTierError` for a blocked egress
+            // and for a request whose shape it refuses, so the status line and
+            // message cannot tell the two apart. What can: whether the request
+            // that was actually sent carried the anchors the gate checks. Audit
+            // that here instead of asserting a cause. Measured anchors: a tool
+            // named `read`, and an `opencode/*` User-Agent with a session header.
+            const shape = auditGateShape(upstreamBody, retryHeaders || upstreamHeaders);
+            const shapeOk = shape.hasReadTool && shape.userAgentOk && shape.sessionHeaders.length > 0;
+            const missing = [];
+            if (!shape.hasReadTool) missing.push("tool `read`");
+            if (!shape.userAgentOk) missing.push("an `opencode/*` User-Agent");
+            if (shape.sessionHeaders.length === 0) missing.push("a session header");
+            // Correlation id for this rejection. Upstream returns it on every
+            // response, accepted or refused; it is the only handle a support
+            // request or a bug report can quote.
+            const upstreamLogId =
+              typeof upstreamRes.headers?.get === "function"
+                ? upstreamRes.headers.get("x-opencode-log-id")
+                : null;
+            lastGateDiagnostic = {
+              at: Date.now(),
+              status: retryStatus,
+              logId: upstreamLogId,
+              shape,
+              shapeOk,
+              missing,
+              model: targetModel,
+            };
+
+            const verdictText = capacity
+              ? "upstream accepted the transport and the request shape and answered with capacity pressure; the free-tier allowance or the model's capacity is exhausted. Retry later or switch model"
+              : retryFreeTierMsg
+                ? onNode
+                  ? "this process is on Node, whose TLS ClientHello differs from the CLI's (measured: Node 0/6, Bun 6/6 from the same IP). Run the bridge with Bun — `bun server.js` — before suspecting an allowance limit"
+                  : shapeOk
+                    ? "the request carried every anchor the gate checks, so this is the egress: the per-IP free-tier allowance is spent or upstream refuses this network. The real CLI gets the same 403 from the same IP when it is"
+                    : `this bridge produced a shape the gate refuses — missing ${missing.join(", ")}. That is a bridge bug, not an IP allowance: the same 403 is returned for both, which is why it is audited here`
+                : `no further identity change to apply; ${UPDATE_HINT}`;
             console.warn(
               `[opencode-free-bridge] Upstream CLI gate rejected the retry with the refreshed identity (${retryStatus}${
                 retryStatus !== gateStatus ? `, first attempt ${gateStatus}` : ""
-              }): ${retryMsg} — ${
-                capacity
-                  ? "upstream accepted the transport and the request shape and answered with capacity pressure; the free-tier allowance or the model's capacity is exhausted. Retry later or switch model"
-                  : retryFreeTierMsg
-                    ? onNode
-                      ? "request shape already matches upstream, but this process is on Node, whose TLS ClientHello differs from the CLI's (measured: Node 0/6, Bun 6/6 from the same IP). Run the bridge with Bun — `bun server.js` — before suspecting an allowance limit"
-                      : "transport and request shape both match upstream. Either the per-IP free-tier allowance is spent, or upstream is refusing this network; the real CLI returns the same 403 from the same IP when it is (verified). A 429 would mean transport passed and only quota is left"
-                    : `no further identity change to apply; ${UPDATE_HINT}`
-              }`
+              }): ${retryMsg} — ${verdictText}` +
+                (upstreamLogId ? ` [x-opencode-log-id: ${upstreamLogId}]` : "")
             );
-            res.writeHead(upstreamRes.status, { "Content-Type": "application/json" });
+            const outStatus = resolveIpThrottleStatus(upstreamRes.status, retryFreeTierMsg && !capacity);
+            res.writeHead(
+              outStatus,
+              buildIpThrottleHeaders(retryFreeTierMsg && !capacity, {
+                shapeOk,
+                logId: upstreamLogId,
+              })
+            );
             return res.end(
               JSON.stringify({
                 error: {
@@ -1657,7 +1908,7 @@ function handleRequest(req, res) {
                   // an "update the bridge" hint would send the user the wrong way.
                   message: retryFreeTierMsg ? retryMsg : `${retryMsg} (${UPDATE_HINT})`,
                   type: retryType,
-                  code: upstreamRes.status,
+                  code: outStatus,
                 },
               })
             );
@@ -1675,11 +1926,46 @@ function handleRequest(req, res) {
         // PATH A: Client requested streaming (SSE)
         // ==========================================
         if (clientStream) {
-          res.writeHead(200, {
-            "Content-Type": "text/event-stream; charset=utf-8",
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-          });
+          let sseHeadersSent = false;
+          const writeSse = (payload) => {
+            if (!sseHeadersSent) {
+              sseHeadersSent = true;
+              res.writeHead(200, {
+                "Content-Type": "text/event-stream; charset=utf-8",
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+              });
+            }
+            res.write(payload);
+          };
+          const emitStreamError = (errMessage, errType) => {
+            console.warn(`[opencode-free-bridge] Upstream failed inside the stream: ${errMessage}`);
+            reader.cancel().catch(() => {});
+            if (!sseHeadersSent) {
+              sseHeadersSent = true;
+              res.writeHead(502, { "Content-Type": "application/json" });
+              res.end(
+                JSON.stringify({
+                  error: {
+                    message: errMessage,
+                    type: errType || "upstream_error",
+                    code: 502,
+                  },
+                })
+              );
+              return;
+            }
+            writeSse(
+              `data: ${JSON.stringify({
+                error: {
+                  message: errMessage,
+                  type: errType || "upstream_error",
+                  code: 502,
+                },
+              })}\n\n`
+            );
+            writeSse("data: [DONE]\n\n");
+          };
 
           if (useResponses) {
             const toolIndexMap = new Map();
@@ -1699,21 +1985,11 @@ function handleRequest(req, res) {
                 const inStreamError = extractStreamError(ev);
                 if (inStreamError) {
                   streamAbortedByError = true;
-                  console.warn(`[opencode-free-bridge] Upstream failed inside the stream: ${inStreamError}`);
-                  res.write(
-                    `data: ${JSON.stringify({
-                      error: {
-                        message: inStreamError,
-                        type: ev?.error?.type || "upstream_error",
-                        code: 502,
-                      },
-                    })}\n\n`
-                  );
-                  res.write("data: [DONE]\n\n");
+                  emitStreamError(inStreamError, ev?.error?.type);
                   return;
                 }
                 if (ev.type === "response.output_text.delta" && ev.delta) {
-                  res.write(
+                  writeSse(
                     `data: ${JSON.stringify({
                       id: completionId,
                       object: "chat.completion.chunk",
@@ -1728,7 +2004,7 @@ function handleRequest(req, res) {
                     ev.type === "response.reasoning.delta") &&
                   ev.delta
                 ) {
-                  res.write(
+                  writeSse(
                     `data: ${JSON.stringify({
                       id: completionId,
                       object: "chat.completion.chunk",
@@ -1752,7 +2028,7 @@ function handleRequest(req, res) {
                     if (ev.output_index !== undefined) toolIndexMap.set(String(ev.output_index), toolIdx);
                   }
                   const restoredName = restoreClientToolName(ev.item.name, aliasToOriginal);
-                  res.write(
+                  writeSse(
                     `data: ${JSON.stringify({
                       id: completionId,
                       object: "chat.completion.chunk",
@@ -1779,7 +2055,7 @@ function handleRequest(req, res) {
                 } else if (ev.type === "response.function_call_arguments.delta" && ev.delta) {
                   const key = ev.output_index !== undefined ? String(ev.output_index) : ev.item_id || ev.call_id;
                   const toolIdx = key !== undefined && toolIndexMap.has(key) ? toolIndexMap.get(key) : 0;
-                  res.write(
+                  writeSse(
                     `data: ${JSON.stringify({
                       id: completionId,
                       object: "chat.completion.chunk",
@@ -1810,10 +2086,13 @@ function handleRequest(req, res) {
             };
 
             await consumeSseLines(reader, decoder, handleResponsesStreamLine);
-            if (streamAbortedByError) return res.end();
+            if (streamAbortedByError) {
+              if (!res.writableEnded) res.end();
+              return;
+            }
 
             const finalFinishReason = upstreamFinishReason || (hasToolCalls ? "tool_calls" : "stop");
-            res.write(
+            writeSse(
               `data: ${JSON.stringify({
                 id: completionId,
                 object: "chat.completion.chunk",
@@ -1823,7 +2102,7 @@ function handleRequest(req, res) {
               })}\n\n`
             );
             if (body.stream_options?.include_usage && streamUsage) {
-              res.write(
+              writeSse(
                 `data: ${JSON.stringify({
                   id: completionId,
                   object: "chat.completion.chunk",
@@ -1834,7 +2113,7 @@ function handleRequest(req, res) {
                 })}\n\n`
               );
             }
-            res.write("data: [DONE]\n\n");
+            writeSse("data: [DONE]\n\n");
             return res.end();
           } else {
             // Chat Completions API SSE stream
@@ -1846,36 +2125,25 @@ function handleRequest(req, res) {
               const raw = line.slice(6).trim();
               if (!raw) return;
               if (raw === "[DONE]") {
-                res.write("data: [DONE]\n\n");
+                writeSse("data: [DONE]\n\n");
                 return;
               }
-              // A mid-stream failure is not a completion. Forward it as an error
-              // event so the client can tell the difference, and stop reading.
-              // The `"error"` substring check keeps the zero-parse fast path
-              // below intact for normal chunks.
+              // A failure inside the stream is not a completion. If no chunk has
+              // been sent yet, return HTTP 502 JSON so any router or harness can
+              // fail over; if chunks were already sent, emit an SSE error event.
               if (raw.includes('"error"')) try {
                 const maybe = JSON.parse(raw);
                 const streamErr = extractStreamError(maybe);
                 if (streamErr) {
                   streamAbortedByError = true;
-                  console.warn(`[opencode-free-bridge] Upstream failed inside the stream: ${streamErr}`);
-                  res.write(
-                    `data: ${JSON.stringify({
-                      error: {
-                        message: streamErr,
-                        type: maybe?.error?.type || "upstream_error",
-                        code: 502,
-                      },
-                    })}\n\n`
-                  );
-                  res.write("data: [DONE]\n\n");
+                  emitStreamError(streamErr, maybe?.error?.type);
                   return;
                 }
               } catch {}
               // Zero-parse fast path: when no client tools are aliased and the chunk
               // carries no `"reasoning":` field to normalize, forward raw SSE bytes directly.
               if (!hasAliases && !raw.includes('"reasoning"')) {
-                res.write(`data: ${raw}\n\n`);
+                writeSse(`data: ${raw}\n\n`);
                 return;
               }
               try {
@@ -1891,14 +2159,18 @@ function handleRequest(req, res) {
                     }
                   }
                 }
-                res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+                writeSse(`data: ${JSON.stringify(chunk)}\n\n`);
               } catch {
-                res.write(`data: ${raw}\n\n`);
+                writeSse(`data: ${raw}\n\n`);
               }
             };
 
             await consumeSseLines(reader, decoder, handleChatStreamLine);
-            return res.end();
+            if (!res.writableEnded) {
+              if (!sseHeadersSent) writeSse("data: [DONE]\n\n");
+              res.end();
+            }
+            return;
           }
         }
 
@@ -2267,6 +2539,10 @@ module.exports = {
   identity,
   __getUserAgent: () => currentUserAgent,
   __syncUserAgent: syncUserAgent,
+  __getGateDiagnostic: () => lastGateDiagnostic,
+  __getLastUpstreamError: () => lastUpstreamError,
+  __auditGateShape: auditGateShape,
+  gateSafeUserAgent,
   DISCOVERY_TTL_MS,
   CLI_VERSION_TTL_MS,
   __setLastDiscoveryTime: (v) => { lastDiscoveryTime = v; },

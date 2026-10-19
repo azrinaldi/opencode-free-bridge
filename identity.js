@@ -109,6 +109,11 @@ function getCatalogCacheFile() {
   const dir = getCatalogCacheDir();
   return dir ? require("path").join(dir, "catalog.json") : null;
 }
+function getSourceCacheFile() {
+  const dir = getCatalogCacheDir();
+  return dir ? require("path").join(dir, "source-recipe.json") : null;
+}
+const BOOT_FETCH = global.fetch;
 const CATALOG_CACHE_DIR = getCatalogCacheDir();
 const CATALOG_CACHE_FILE = getCatalogCacheFile();
 
@@ -199,6 +204,54 @@ const DEFAULT_TOOLS = Object.freeze({
 
 const CORE_TOOL_NAMES = ["read", "shell", "bash"];
 
+/**
+ * Tool names the free-tier gate requires *by name*, independent of what the
+ * derived profile happens to contain.
+ *
+ * Measured against upstream on 2026-10-18 by replaying byte-identical requests
+ * from a blocked egress and a clean one, varying one field at a time:
+ *
+ *   - 12 real tools                     -> 200
+ *   - the same 12 minus `read`          -> 403 FreeTierError
+ *   - the same 12 minus any other tool  -> 200
+ *   - `read` alone                      -> 200
+ *   - `read` + 11 fabricated tools      -> 200
+ *   - a fabricated tool *named* `read`  -> 200
+ *   - the real `read` renamed `read_file` -> 403
+ *
+ * So the check is the name, not the description or the schema: a made-up
+ * `read` with an empty schema passes, a renamed real one fails. That matters
+ * here because the profile is derived from upstream's own plugin sources — if
+ * upstream renames `read.ts` (or drops it), the derived wire shape loses the
+ * anchor and the gate answers with the *same* 403 it uses for an exhausted IP.
+ * Without this anchor the bridge would report a per-IP allowance problem while
+ * the actual cause is a shape this bridge produced.
+ *
+ * The shipped definition is used as the fallback, so the anchor survives a
+ * profile that no longer carries the name.
+ */
+const GATE_ANCHOR_TOOL_NAMES = ["read"];
+
+/**
+ * Header names the gate requires, independent of what the recipe lists.
+ *
+ * Measured the same way (clean egress, `read` tool present):
+ *
+ *   - no User-Agent                        -> 403
+ *   - `opencode` (no version)              -> 403
+ *   - `Mozilla/5.0 …`, `curl/8.18.0`       -> 403
+ *   - `opencode/9.9.9`, `OpenCode/2.0.32`  -> 200
+ *   - `x-opencode-session` alone           -> 200
+ *   - `x-session-affinity` alone           -> 200
+ *   - `x-opencode-session-id` alone        -> 403
+ *   - no `x-opencode-client`/`-project`    -> 200
+ *
+ * The recipe is derived from upstream's request builder, so it normally lists
+ * these. They are pinned anyway because a recipe change that drops one would
+ * produce a 403 indistinguishable from a blocked IP.
+ */
+const GATE_ANCHOR_HEADER_NAMES = ["user-agent", "x-opencode-session", "x-session-affinity"];
+
 let recipe = { ...DEFAULT_RECIPE };
 let toolProfile = null;
 let toolProfileSource = "default";
@@ -251,6 +304,8 @@ let lastSourceTag = null;
 let optionalHeaders = [];
 let lastForcedRefreshTime = 0;
 let stateEpoch = 0;
+let refreshGen = 0;
+let lastSyncedSource = null;
 
 function stableStringify(val) {
   if (!val || typeof val !== "object") return JSON.stringify(val);
@@ -1052,6 +1107,41 @@ function writeCachedCatalog(json) {
   }
 }
 
+function readCachedSource(expectedRef = null) {
+  try {
+    const file = getSourceCacheFile();
+    if (!file) return null;
+    const fs = require("fs");
+    const raw = fs.readFileSync(file, "utf8");
+    const parsed = JSON.parse(raw);
+    if (
+      parsed &&
+      typeof parsed === "object" &&
+      typeof parsed.ref === "string" &&
+      parsed.extracted &&
+      typeof parsed.extracted === "object"
+    ) {
+      if (expectedRef && parsed.ref !== expectedRef) return null;
+      return parsed;
+    }
+  } catch {}
+  return null;
+}
+
+function writeCachedSource(ref, extracted) {
+  if (!ref || !extracted || typeof extracted !== "object") return;
+  try {
+    const dir = getCatalogCacheDir();
+    const file = getSourceCacheFile();
+    if (!dir || !file) return;
+    const fs = require("fs");
+    fs.mkdirSync(dir, { recursive: true });
+    const tmp = `${file}.tmp.${process.pid}`;
+    fs.writeFileSync(tmp, JSON.stringify({ ref, extracted, savedAt: Date.now() }));
+    fs.renameSync(tmp, file);
+  } catch {}
+}
+
 function isTrustedCatalogBaseUrl(url) {
   return typeof url === "string" && /^https:\/\/([a-z0-9-]+\.)*opencode\.ai(\/|$)/i.test(url);
 }
@@ -1691,12 +1781,14 @@ async function refresh({ force = false, recheck = false } = {}) {
   }
 
   refreshInFlightForced = Boolean(force);
+  const myGen = ++refreshGen;
   refreshInFlight = (async () => {
     try {
       const release = await resolveRelease(recipe.version);
       const latest = release.version;
       if (!latest) throw new Error(release.error || "handshake resolved no version");
 
+      if (myGen !== refreshGen) return { updated: false, reason: "reset" };
       lastCheckTime = Date.now();
       lastRefreshError = release.stale ? release.error || "handshake stale" : null;
 
@@ -1748,100 +1840,133 @@ async function refresh({ force = false, recheck = false } = {}) {
       const update = { version: latest };
       let sourceRead = false;
 
-      // Discover the release's tool plugins, falling back to the ones already
-      // known when the directory listing is unavailable (API outage / rate
-      // limit). The known set is kept in `knownPlugins`, so a transient failure
-      // narrows coverage for one refresh instead of erasing it.
-      const discovered = await listSourceDir(PLUGIN_DIR, ref);
-      if (discovered.length > 0) knownPlugins = discovered;
-      const pluginFiles = { codemode: CODEMODE_TOOL_FILE };
-      for (const name of knownPlugins) {
-        pluginFiles[`tool:${name}`] = `${PLUGIN_DIR}/${name}.ts`;
-      }
+      const diskCachedSource =
+        (global.fetch === BOOT_FETCH || process.env.OPENCODE_CACHE_DIR)
+          ? readCachedSource(ref)
+          : null;
+      if (
+        lastSyncedSource &&
+        lastSyncedSource.ref === ref &&
+        lastSyncedSource.fetchRef === global.fetch
+      ) {
+        Object.assign(update, lastSyncedSource.extracted);
+        sourceRead = true;
+      } else if (diskCachedSource && diskCachedSource.extracted) {
+        Object.assign(update, diskCachedSource.extracted);
+        lastSyncedSource = { ref, extracted: diskCachedSource.extracted, fetchRef: global.fetch };
+        sourceRead = true;
+      } else {
+        // Discover the release's tool plugins, falling back to the ones already
+        // known when the directory listing is unavailable (API outage / rate
+        // limit). The known set is kept in `knownPlugins`, so a transient failure
+        // narrows coverage for one refresh instead of erasing it.
+        const discovered = await listSourceDir(PLUGIN_DIR, ref);
+        if (discovered.length > 0) knownPlugins = discovered;
+        const pluginFiles = { codemode: CODEMODE_TOOL_FILE };
+        for (const name of knownPlugins) {
+          pluginFiles[`tool:${name}`] = `${PLUGIN_DIR}/${name}.ts`;
+        }
 
-      const settled = await Promise.allSettled(
-        Object.entries({ ...SOURCE_FILES, ...pluginFiles }).map(async ([key, filePath]) => [
-          key,
-          await fetchText(`${SOURCE_BASE}/${ref}/${filePath}`, SOURCE_TIMEOUT_MS),
-        ])
-      );
-      const fetchedFiles = {};
-      for (const item of settled) {
-        if (item.status === "fulfilled") {
-          fetchedFiles[item.value[0]] = item.value[1];
-          sourceRead = true;
-        }
-      }
-      // Cross-file schema references. `read.ts` writes
-      // `ReadToolFileSystem.PageInput.fields.offset`, and `PageInput` lives in
-      // `../read-filesystem.ts`. Fetch the local modules each plugin imports so
-      // the field's real optionality/type can be resolved instead of guessed.
-      const refFiles = new Map();
-      for (const [key, source] of Object.entries(fetchedFiles)) {
-        if (!key.startsWith("tool:") || typeof source !== "string") continue;
-        // Relative imports: `../read-filesystem.js` → packages/core/src/read-filesystem.ts
-        for (const m of source.matchAll(/import\s+\{([^}]+)\}\s+from\s+"(\.\.?\/[^"]+)\.js"/g)) {
-          const rel = m[2].replace(/^\.\.?\//, "");
-          const resolved = new URL(m[2] + ".ts", `https://x/${PLUGIN_DIR}/`).pathname.replace(/^\//, "");
-          refFiles.set(`ref:${rel.replace(/\//g, "-")}`, resolved);
-        }
-        // Workspace imports: `@opencode/schema/question` → packages/schema/src/question.ts.
-        // This is how a plugin refers to a struct it does not declare itself
-        // (`Question.Prompt`).
-        for (const m of source.matchAll(/from\s+"@opencode\/([a-z-]+)\/([a-z0-9-]+)"/g)) {
-          const pkg = m[1];
-          const mod = m[2];
-          refFiles.set(`ref:${pkg}-${mod}`, `packages/${pkg}/src/${mod}.ts`);
-        }
-      }
-      if (refFiles.size > 0) {
-        const refSettled = await Promise.allSettled(
-          [...refFiles.entries()].map(async ([key, filePath]) => [
+        const settled = await Promise.allSettled(
+          Object.entries({ ...SOURCE_FILES, ...pluginFiles }).map(async ([key, filePath]) => [
             key,
             await fetchText(`${SOURCE_BASE}/${ref}/${filePath}`, SOURCE_TIMEOUT_MS),
           ])
         );
-        for (const item of refSettled) {
-          if (item.status === "fulfilled") fetchedFiles[item.value[0]] = item.value[1];
+        const fetchedFiles = {};
+        for (const item of settled) {
+          if (item.status === "fulfilled") {
+            fetchedFiles[item.value[0]] = item.value[1];
+            sourceRead = true;
+          }
         }
-      }
-
-      // Some tools keep their description in a sibling `.txt` (patch.ts). Fetch
-      // those too: the description is part of the wire schema, and a tool whose
-      // schema cannot be built is dropped from the profile.
-      const txtRefs = [];
-      for (const [key, source] of Object.entries(fetchedFiles)) {
-        if (!key.startsWith("tool:")) continue;
-        const probe = extractToolFromSource(source, key.replace(/^tool:/, ""));
-        if (probe && probe.descriptionFile) {
-          txtRefs.push({ key, file: probe.descriptionFile, varName: probe.descriptionVar });
+        // Cross-file schema references. `read.ts` writes
+        // `ReadToolFileSystem.PageInput.fields.offset`, and `PageInput` lives in
+        // `../read-filesystem.ts`. Fetch the local modules each plugin imports so
+        // the field's real optionality/type can be resolved instead of guessed.
+        const refFiles = new Map();
+        for (const [key, source] of Object.entries(fetchedFiles)) {
+          if (!key.startsWith("tool:") || typeof source !== "string") continue;
+          // Relative imports: `../read-filesystem.js` → packages/core/src/read-filesystem.ts
+          for (const m of source.matchAll(/import\s+\{([^}]+)\}\s+from\s+"(\.\.?\/[^"]+)\.js"/g)) {
+            const rel = m[2].replace(/^\.\.?\//, "");
+            const resolved = new URL(m[2] + ".ts", `https://x/${PLUGIN_DIR}/`).pathname.replace(/^\//, "");
+            refFiles.set(`ref:${rel.replace(/\//g, "-")}`, resolved);
+          }
+          // Workspace imports: `@opencode/schema/question` → packages/schema/src/question.ts.
+          // This is how a plugin refers to a struct it does not declare itself
+          // (`Question.Prompt`).
+          for (const m of source.matchAll(/from\s+"@opencode\/([a-z-]+)\/([a-z0-9-]+)"/g)) {
+            const pkg = m[1];
+            const mod = m[2];
+            refFiles.set(`ref:${pkg}-${mod}`, `packages/${pkg}/src/${mod}.ts`);
+          }
         }
-      }
-      if (txtRefs.length > 0) {
-        const txtSettled = await Promise.allSettled(
-          txtRefs.map(async (t) => {
-            const dir = PLUGIN_DIR;
-            // `../patch.txt` is relative to the plugin directory.
-            const resolved = new URL(t.file, `https://x/${dir}/`).pathname.replace(/^\//, "");
-            return [t, await fetchText(`${SOURCE_BASE}/${ref}/${resolved}`, SOURCE_TIMEOUT_MS)];
-          })
-        );
-        for (const item of txtSettled) {
-          if (item.status !== "fulfilled") continue;
-          const [t, text] = item.value;
-          const src = fetchedFiles[t.key];
-          if (typeof src !== "string") continue;
-          // Replace the identifier with a string literal so the existing
-          // description parser can read it.
-          fetchedFiles[t.key] = src.replace(
-            new RegExp(`\\b${t.varName}\\b(?!\\s+from)`),
-            JSON.stringify(text.trim())
+        if (refFiles.size > 0) {
+          const refSettled = await Promise.allSettled(
+            [...refFiles.entries()].map(async ([key, filePath]) => [
+              key,
+              await fetchText(`${SOURCE_BASE}/${ref}/${filePath}`, SOURCE_TIMEOUT_MS),
+            ])
           );
+          for (const item of refSettled) {
+            if (item.status === "fulfilled") fetchedFiles[item.value[0]] = item.value[1];
+          }
         }
-      }
 
-      if (sourceRead) {
-        Object.assign(update, extractRecipe(fetchedFiles));
+        // Some tools keep their description in a sibling `.txt` (patch.ts). Fetch
+        // those too: the description is part of the wire schema, and a tool whose
+        // schema cannot be built is dropped from the profile.
+        const txtRefs = [];
+        for (const [key, source] of Object.entries(fetchedFiles)) {
+          if (!key.startsWith("tool:")) continue;
+          const probe = extractToolFromSource(source, key.replace(/^tool:/, ""));
+          if (probe && probe.descriptionFile) {
+            txtRefs.push({ key, file: probe.descriptionFile, varName: probe.descriptionVar });
+          }
+        }
+        if (txtRefs.length > 0) {
+          const txtSettled = await Promise.allSettled(
+            txtRefs.map(async (t) => {
+              const dir = PLUGIN_DIR;
+              // `../patch.txt` is relative to the plugin directory.
+              const resolved = new URL(t.file, `https://x/${dir}/`).pathname.replace(/^\//, "");
+              return [t, await fetchText(`${SOURCE_BASE}/${ref}/${resolved}`, SOURCE_TIMEOUT_MS)];
+            })
+          );
+          for (const item of txtSettled) {
+            if (item.status !== "fulfilled") continue;
+            const [t, text] = item.value;
+            const src = fetchedFiles[t.key];
+            if (typeof src !== "string") continue;
+            // Replace the identifier with a string literal so the existing
+            // description parser can read it.
+            fetchedFiles[t.key] = src.replace(
+              new RegExp(`\\b${t.varName}\\b(?!\\s+from)`),
+              JSON.stringify(text.trim())
+            );
+          }
+        }
+
+        if (sourceRead) {
+          const extracted = extractRecipe(fetchedFiles);
+          Object.assign(update, extracted);
+          const allCoreFetched = Object.keys(SOURCE_FILES).every(
+            (k) => typeof fetchedFiles[k] === "string" && fetchedFiles[k].length > 0
+          );
+          const allSettledOk = settled.every((item) => item.status === "fulfilled");
+          if (allCoreFetched && allSettledOk) {
+            lastSyncedSource = { ref, extracted, fetchRef: global.fetch };
+            if (extracted.tools && Object.keys(extracted.tools).length > 0) {
+              writeCachedSource(ref, extracted);
+            }
+          }
+        } else {
+          const fallbackSource = readCachedSource(ref) || readCachedSource();
+          if (fallbackSource && fallbackSource.extracted) {
+            Object.assign(update, fallbackSource.extracted);
+          }
+        }
       }
 
       // Endpoints live in the provider catalog, not in the git source tree.
@@ -1850,6 +1975,7 @@ async function refresh({ force = false, recheck = false } = {}) {
       const catalog = await extractCatalog();
       Object.assign(update, catalog);
 
+      if (myGen !== refreshGen) return { updated: false, reason: "reset" };
       const changed = applyRecipe(update, ref);
       if (isForced && sourceRead && !release.stale) {
         lastForcedRefreshTime = Date.now();
@@ -1868,11 +1994,15 @@ async function refresh({ force = false, recheck = false } = {}) {
         },
       };
     } catch (err) {
-      lastRefreshError = err.message || String(err);
-      return { updated: false, error: lastRefreshError };
+      if (myGen === refreshGen) {
+        lastRefreshError = err.message || String(err);
+      }
+      return { updated: false, error: err.message || String(err) };
     } finally {
-      refreshInFlight = null;
-      refreshInFlightForced = false;
+      if (myGen === refreshGen) {
+        refreshInFlight = null;
+        refreshInFlightForced = false;
+      }
     }
   })();
 
@@ -2175,8 +2305,16 @@ function getToolList(flat = false, scope = null, modelId = null) {
     ordered = coreNames.length > 0 ? coreNames : available;
   }
 
+  // Pin the gate anchors last, so the derived order is otherwise untouched.
+  // `profile[name]` may be missing when upstream renamed or dropped the tool:
+  // the shipped definition is then the only thing that keeps the wire shape
+  // acceptable. See GATE_ANCHOR_TOOL_NAMES for the measurements.
+  for (const name of GATE_ANCHOR_TOOL_NAMES) {
+    if (!ordered.includes(name)) ordered = [...ordered, name];
+  }
+
   return ordered.map((name) => {
-    const def = profile[name];
+    const def = profile[name] || DEFAULT_TOOLS[name];
     const description = withDynamicDescription(name, def.description);
     return flat
       ? {
@@ -2230,7 +2368,14 @@ function buildGateHeaders(ctx = {}) {
   };
   const headers = {};
   const unsent = [];
-  for (const name of getHeaderNames()) {
+  const names = getHeaderNames().slice();
+  // Pin the anchors even when the recipe stops listing them: the gate rejects
+  // a request without these with the same 403 it uses for a blocked IP, so a
+  // recipe regression would be indistinguishable from an exhausted allowance.
+  for (const anchor of GATE_ANCHOR_HEADER_NAMES) {
+    if (!names.some((n) => String(n).toLowerCase() === anchor)) names.push(anchor);
+  }
+  for (const name of names) {
     const lower = String(name).toLowerCase();
     const value = values[lower];
     // Header names are case-insensitive. Emit one canonical spelling per name
@@ -2322,6 +2467,9 @@ function __reset() {
   lastForcedRefreshTime = 0;
   stateEpoch++;
   refreshInFlight = null;
+  refreshInFlightForced = false;
+  refreshGen++;
+  lastSyncedSource = null;
   versionFloor = null;
   lastRefreshError = null;
   lastSourceTag = null;
@@ -2356,9 +2504,19 @@ function __setToolProfile(tools, source = "test") {
 {
   const bootCatalog = readCachedCatalog();
   if (bootCatalog) applyRecipe(parseCatalogData(bootCatalog));
+  const bootSource = readCachedSource();
+  if (bootSource && bootSource.extracted) {
+    applyRecipe(bootSource.extracted, bootSource.ref);
+    lastSyncedSource = {
+      ref: bootSource.ref,
+      extracted: bootSource.extracted,
+      fetchRef: global.fetch,
+    };
+  }
 }
 module.exports = {
   IDENTITY_TTL_MS,
+  GATE_REFRESH_COOLDOWN_MS,
    get UPDATE_MODE() {
     return getUpdateMode();
   },
@@ -2374,6 +2532,8 @@ module.exports = {
   resolveRelease,
   parseCatalogData,
   extractCatalog,
+  readCachedSource,
+  writeCachedSource,
   extractToolFromSource,
   extractToolNames,
   extractToolOverrides,
@@ -2399,6 +2559,8 @@ module.exports = {
   resolveModelAlias,
   getEndpoints,
   buildGateHeaders,
+  GATE_ANCHOR_TOOL_NAMES,
+  GATE_ANCHOR_HEADER_NAMES,
   getSessionPrefix,
   createSessionId,
   getToolList,
