@@ -331,7 +331,7 @@ function scheduleHealthWrite(delayMs = 1000) {
 }
 
 /**
- * Re-apply health saved by an earlier process. An Instabox suspend or a service
+ * Re-apply health saved by an earlier process. An upstream suspend or a service
  * restart would otherwise forget which IPs are spent and re-burn all of them.
  *
  * The in-memory record wins when it already exists: a restart is the only thing

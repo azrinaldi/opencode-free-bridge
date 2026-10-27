@@ -1,4 +1,27 @@
 # Changelog
+## [Unreleased]
+A spent egress stays spent, and a 429 no longer reaches the caller early.
+
+OpenCode resets the free allowance once a day and says so: a spent IP answers
+`429 FreeUsageLimitError` with `Retry-After: ~77415` (about 21.5 hours). The
+bridge ignored that header and parked the IP for `cooldownMs * 4` — 8 minutes —
+then backed off exponentially to a 30-minute cap. A spent IP therefore rejoined
+rotation every 8-30 minutes, was refused again, and burned one request on every
+probe. Under `failover`, which always returns `healthy[0]`, the same spent IP at
+the front of the pool was retried first while the rest of the pool idled.
+
+- `retryAfterMs(res)` reads `Retry-After` (delta-seconds or HTTP-date) and all
+  four 429 sites pass it as `cooldownMs`, so a spent entry leaves rotation until
+  the allowance actually returns. Missing or unparseable headers keep the old
+  fixed cooldown, so a gateway that omits the header cannot regress.
+- A 429 now walks the whole pool instead of failing over once. Two spent IPs at
+  the front used to hand the caller a 429 while six healthy IPs sat idle; now
+  every enabled member is tried and `429` only reaches the caller when the pool
+  is exhausted, which is the honest answer at that point.
+- Each refusal on the walk is recorded with that response's own `Retry-After`,
+  so a second spent IP is parked for its own reset window rather than the
+  default.
+- `proxy.js`: comment wording only (an upstream suspend, not a specific host).
 
 ## [2.3.1] — 2026-10-25
 

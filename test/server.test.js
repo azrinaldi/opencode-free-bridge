@@ -1330,6 +1330,97 @@ describe("server unit & integration tests", () => {
       }
     });
 
+    it("walks past two spent egresses instead of returning 429 to the caller", async () => {
+      // The reason this walk exists: failing over exactly once meant two spent
+      // IPs at the front of the pool handed the caller a 429 while every other
+      // entry was healthy. With three entries and the first two spent, the
+      // request must still succeed on the third.
+      const fs = require("node:fs");
+      const os = require("node:os");
+      const path = require("node:path");
+      const proxy = require("../proxy");
+      const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "ofb-429-walk-"));
+      const previousStateDir = process.env.OPENCODE_BRIDGE_STATE_DIR;
+      process.env.OPENCODE_BRIDGE_STATE_DIR = stateDir;
+      delete process.env.UPSTREAM_PROXY_POOL;
+      proxy.__reload();
+      proxy.resetHealth();
+      try {
+        const saved = proxy.setPool({
+          entries: ["http://one:1", "http://two:2", "http://three:3"],
+          strategy: "failover",
+          cooldownMs: 60000,
+        });
+        assert.equal(saved.ok, true);
+        const usedEgress = [];
+        const spent = new Set(["http://one:1", "http://two:2"]);
+        mockFetchImpl = async (_url, init) => {
+          const egress = init?.proxy || "direct";
+          usedEgress.push(egress);
+          if (spent.has(egress)) {
+            return {
+              ok: false,
+              status: 429,
+              // A real reset window, not the 8-minute default: the walk must
+              // park each spent entry for what upstream asked for.
+              headers: new Map([["retry-after", "77415"]]),
+              text: async () =>
+                JSON.stringify({
+                  error: { type: "FreeUsageLimitError", message: "Free usage limit reached." },
+                }),
+            };
+          }
+          return {
+            ok: true,
+            status: 200,
+            body: sseStreamFromLines([
+              'data: {"id":"1","choices":[{"index":0,"delta":{"content":"OK"},"finish_reason":"stop"}]}\n\n',
+              "data: [DONE]\n\n",
+            ]),
+          };
+        };
+        const res = await httpRequest(port, "POST", "/v1/chat/completions", {
+          model: "glm-5.3-flash-free",
+          messages: [{ role: "user", content: "walk-past-two" }],
+          stream: true,
+        });
+        assert.equal(res.status, 200, "the third entry must serve the request");
+        assert.deepEqual(
+          usedEgress,
+          ["http://one:1", "http://two:2", "http://three:3"],
+          "both spent entries must be tried before the healthy one"
+        );
+
+        const state = proxy.describe();
+        const byHost = (h) => state.pool.entries.find((e) => e.host === h);
+        assert.equal(byHost("one:1").state, "cooling");
+        assert.equal(byHost("two:2").state, "cooling");
+        assert.equal(byHost("three:3").state, "ready");
+        assert.equal(state.pool.ready, 1);
+
+        // Retry-After must drive the cooldown, not the 60s pool default.
+        // describe() already exposes cooldownMsLeft, so this asserts against a
+        // value that actually exists — an earlier draft checked a helper that
+        // did not, which silently skipped the assertion.
+        const one = byHost("one:1");
+        const two = byHost("two:2");
+        assert.ok(
+          one.cooldownMsLeft > 3600_000,
+          `one:1 cooldown must reflect Retry-After 77415s, got ${one.cooldownMsLeft}ms`
+        );
+        assert.ok(
+          two.cooldownMsLeft > 3600_000,
+          `two:2 cooldown must reflect Retry-After 77415s, got ${two.cooldownMsLeft}ms`
+        );
+      } finally {
+        proxy.setPool({ entries: [] });
+        proxy.resetHealth();
+        if (previousStateDir === undefined) delete process.env.OPENCODE_BRIDGE_STATE_DIR;
+        else process.env.OPENCODE_BRIDGE_STATE_DIR = previousStateDir;
+        proxy.__reload();
+        fs.rmSync(stateDir, { recursive: true, force: true });
+      }
+    });
     it("retries once with a fresh session ID on transient upstream 5xx and recovers to 200", async () => {
       const seenSessions = [];
       let attempt = 0;
