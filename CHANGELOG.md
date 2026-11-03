@@ -1,5 +1,23 @@
 # Changelog
 ## [Unreleased]
+A pool member no longer burns its allowance over the address family the gateway refuses.
+
+The free tier refuses IPv6 egress and accepts IPv4: the same request, from the
+same host, answered `200` over IPv4 and `429 FreeUsageLimitError` over IPv6. Bun
+resolves in `verbatim` order by default, and every dual-stack host listed AAAA
+for `opencode.ai` first. `server.js` already pinned `ipv4first` for its own
+fetches, but `egress-proxy.js` dials the upstream itself for every CONNECT and
+did not — so a pool member tunnelled every request out over IPv6, was refused,
+and took the whole pool into a day-long cooldown. Six of eight members were
+unusable while their IPv4 addresses still had allowance.
+
+- `egress-proxy.js` calls `dns.setDefaultResultOrder(DNS_RESULT_ORDER || "ipv4first")`
+  at startup, matching `server.js`. Pool entries on dual-stack hosts now exit
+  over IPv4 and answer `200`.
+- The `Retry-After` cooldown above made this worse: a refusal recorded by the
+  IPv6 path parked the entry until the next daily reset, so the family could not
+  be re-tested until then.
+
 A spent egress stays spent, and a 429 no longer reaches the caller early.
 
 OpenCode resets the free allowance once a day and says so: a spent IP answers
