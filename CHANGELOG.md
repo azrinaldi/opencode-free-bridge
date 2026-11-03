@@ -1,5 +1,24 @@
 # Changelog
 
+## [Unreleased]
+
+`429 FreeUsageLimitError` is also a tool-name filter.
+
+A client tool called `run_code` makes upstream answer the quota message even
+when the request is otherwise identical to one that answers `200`; the same
+schema under `run-code`, `runcode`, `run_program` or `code_exec` is accepted, and
+adding the `read` anchor alongside it does not help. A PTC-style harness that
+collapses its tool set into a single `run_code` tool therefore failed every turn
+with what looked like a spent allowance.
+
+- A client tool whose name matches `run_code` is sent upstream as `run_program`
+  and renamed back on the way out: streaming deltas, `tool_choice` and
+  tool-result turns all carry the client's own name.
+- An alias the client already owns is left alone; the renamed copy becomes
+  `run_program2` instead of shadowing a live tool.
+- The filter is documented in the troubleshooting section with the measured
+  name matrix.
+
 ## [2.3.1] — 2026-10-25
 
 Pool health survives a restart.

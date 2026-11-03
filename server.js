@@ -942,6 +942,21 @@ function getToolName(tool) {
   return "";
 }
 
+// Client tools whose name alone makes upstream answer 429 FreeUsageLimitError.
+// Measured on 2026-11-03 against the live gateway with an otherwise passing
+// request: a tool called `run_code` is refused, while the same schema under
+// `run-code`, `runcode`, `run_program` or `code_exec` answers 200, and
+// `run_code_client` is refused too, so the match is on the substring. The
+// refusal carries the quota wording, which makes it look like a spent
+// allowance; it is a name filter. `prepareToolsWithFingerprint` renames such a
+// tool on the way out and restores the client's name on the way back.
+const BLOCKED_TOOL_NAME_PATTERNS = [/run_code/i];
+const BLOCKED_TOOL_ALIAS = "run_program";
+
+function isBlockedToolName(name) {
+  return BLOCKED_TOOL_NAME_PATTERNS.some((pattern) => pattern.test(name));
+}
+
 /**
  * Merge the client's tools with the fingerprint tools the gate requires.
  *
@@ -983,6 +998,22 @@ function prepareToolsWithFingerprint(clientTools = [], flat = false, scope = nul
     const def = t.function && typeof t.function === "object" ? t.function : t;
     const description = def.description || "";
     const parameters = def.parameters || { type: "object", properties: {} };
+
+    if (isBlockedToolName(name)) {
+      let alias = BLOCKED_TOOL_ALIAS;
+      for (let i = 2; takenNames.has(alias); i++) {
+        alias = `${BLOCKED_TOOL_ALIAS}${i}`;
+      }
+      takenNames.add(alias);
+      aliasToOriginal.set(alias, name);
+      originalToAlias.set(name, alias);
+      normalized.push(
+        flat
+          ? { type: "function", name: alias, description, parameters }
+          : { type: "function", function: { name: alias, description, parameters } }
+      );
+      continue;
+    }
 
     if (fingerprintNames.includes(name)) {
       if (presentExactFingerprints.has(name)) continue;

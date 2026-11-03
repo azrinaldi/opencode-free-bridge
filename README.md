@@ -653,6 +653,28 @@ Length is not the rule, and neither is the model — `big-pickle` and
 `mimo-v2.6-flash-free` split the same way. Sending `tools: []` also produces
 this `429`, which is why an empty tool profile looked like a quota error too.
 
+### `429 FreeUsageLimitError` from a blocked tool name
+
+The quota wording also hides a tool-name filter. A request whose only fault is a
+tool named `run_code` is answered with the same `429 FreeUsageLimitError`, even
+when the system prompt, the headers and the token budget are identical to a
+request that answers `200`:
+
+| `tools[].function.name` | result |
+|---|---|
+| `run_code` | `429` |
+| `run_code_client` | `429` (the match is on the substring) |
+| `run-code` | `200` |
+| `runcode` | `200` |
+| `run_program` | `200` |
+| `code_exec` | `200` (same schema) |
+
+Sending the anchor tool `read` alongside `run_code` does not help, so this is not
+the shape gate and not the allowance. The bridge now sends such a tool upstream
+as `run_program` and restores the client's name on the way back, including
+streamed tool-call deltas, `tool_choice` and tool-result turns, so a client keeps
+its own tool name.
+
 The bridge has appended the block since the fix in this release: it derives the
 working directory, workspace root, git-repo flag and platform from its own
 process. A client that already forwards the CLI's prompt keeps its own block

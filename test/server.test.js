@@ -13,6 +13,7 @@ const {
   isResponsesModel,
   markProtocolSupport,
   prepareToolsWithFingerprint,
+  restoreClientToolName,
   buildUpstreamHeaders,
   buildUpstreamPayload,
   getPersistentSessionId,
@@ -332,6 +333,44 @@ describe("server unit & integration tests", () => {
     // Chat nests the definition under `function`; Responses puts it flat.
     assert.ok(chat.tools.every((t) => t.function && t.type === "function"));
     assert.ok(responses.tools.every((t) => !t.function && t.type === "function"));
+  });
+
+  it("renames a client tool upstream refuses by name, then restores it on the way back", () => {
+    // Measured against the live gateway: a request whose only fault is a tool
+    // named `run_code` answers `429 FreeUsageLimitError`, while the same schema
+    // under `run-code`, `runcode`, `run_program` or `code_exec` answers `200`.
+    // The refusal is a name filter wearing the quota wording, so the bridge
+    // sends the tool under an accepted name and maps it back for the client.
+    const tool = (name) => ({
+      type: "function",
+      function: {
+        name,
+        description: "Execute a program",
+        parameters: { type: "object", properties: { code: { type: "string" } } },
+      },
+    });
+
+    const chat = prepareToolsWithFingerprint([tool("run_code")], false);
+    const chatNames = chat.tools.map((t) => t.function.name);
+    assert.ok(chatNames.includes("run_program"));
+    assert.ok(!chatNames.some((n) => /run_code/.test(n)));
+    assert.equal(chat.aliasToOriginal.get("run_program"), "run_code");
+    assert.equal(chat.originalToAlias.get("run_code"), "run_program");
+    assert.equal(restoreClientToolName("run_program", chat.aliasToOriginal), "run_code");
+    // An unrelated name is passed through untouched.
+    assert.equal(restoreClientToolName("pwsh", chat.aliasToOriginal), "pwsh");
+
+    const responses = prepareToolsWithFingerprint([tool("run_code")], true);
+    assert.ok(responses.tools.some((t) => t.name === "run_program"));
+    assert.ok(!responses.tools.some((t) => /run_code/.test(t.name)));
+
+    // A client that already owns the alias keeps it; the renamed copy steps
+    // aside instead of shadowing a live tool.
+    const both = prepareToolsWithFingerprint([tool("run_program"), tool("run_code")], false);
+    const bothNames = both.tools.map((t) => t.function.name);
+    assert.ok(bothNames.includes("run_program"));
+    assert.ok(bothNames.includes("run_program2"));
+    assert.equal(both.aliasToOriginal.get("run_program2"), "run_code");
   });
 
   it("generates 10,000 session IDs using pooled random bytes in <25ms", () => {
