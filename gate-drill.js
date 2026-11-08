@@ -1027,7 +1027,13 @@ async function main() {
 
 let port = () => 0;
 
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+// Exported for test/drill-semantics.test.js: the tri-state verdict contract
+// (true / null / false) is what keeps an undecided live drill from failing CI.
+module.exports = { DRILLS, judge };
+
+if (require.main === module) {
+  main().catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });
+}
