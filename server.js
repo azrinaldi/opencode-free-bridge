@@ -8,6 +8,7 @@ try {
   VERSION = require("./package.json").version || VERSION;
 } catch {}
 const { effectiveMaxTokens } = require("./token-budget");
+const { handleAnthropicMessages } = require("./anthropic");
 
 /**
  * Load a sibling module, or a fallback when the file is not on disk yet.
@@ -2087,6 +2088,24 @@ function handleRequest(req, res) {
     }
     res.writeHead(200, { "Content-Type": "application/json" });
     return res.end(cachedModelsPayload);
+  }
+
+  // Anthropic Messages API
+  if (req.method === "POST" && (pathname === "/v1/messages" || pathname === "/messages")) {
+    handleAnthropicMessages(req, res).catch((err) => {
+      if (res.headersSent) {
+        res.destroy();
+        return;
+      }
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({
+          type: "error",
+          error: { type: "server_error", message: err.message || "Internal server error" },
+        })
+      );
+    });
+    return;
   }
 
   // Chat completions
