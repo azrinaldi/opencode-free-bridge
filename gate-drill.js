@@ -325,10 +325,17 @@ async function drillSessionShape({ identity, __syncUserAgent, sessionCache }) {
 
   lineMaybe(judge(res.status === 200, busy), "client received 200, not the FreeTierError");
   lineMaybe(judge(content(res).length > 0, busy), "client received real content");
-  line(prefixRestored, "prefix restored by the refresh");
-  line(shapeOk, "re-minted id matches the accepted shape");
-  line(cacheClean, "no rejected id left in the session cache");
+  // This drill stages a 403 shape rejection, and the refresh it asserts only
+  // runs on one. Upstream now answers a malformed id with the same
+  // `429 FreeUsageLimitError` it uses for a spent allowance, so a 429 means the
+  // premise never ran — capacity, not a bridge fault. Reporting FAIL there
+  // blamed the bridge for upstream's verdict, which the two lines above
+  // already model as undecided.
+  lineMaybe(judge(prefixRestored, busy), "prefix restored by the refresh");
+  lineMaybe(judge(shapeOk, busy), "re-minted id matches the accepted shape");
+  lineMaybe(judge(cacheClean, busy), "no rejected id left in the session cache");
 
+  if (busy) return null;
   if (!prefixRestored || !shapeOk || !cacheClean) return false;
   return judge(answered, busy);
 }

@@ -400,7 +400,7 @@ Before running the 4 live drills, `gate-drill.js` sends a single CLI-shaped cont
 | `UPDATE_MODE` | `reactive` | `reactive` adopts new CLI releases only on `403`/`426` or `minimum: true`; `always` adopts every release on TTL expiry |
 | `GATE_RETRY_COOLDOWN_MS` | `30000` | Cooldown window (ms) after a failed full-shape `403` retry during which duplicate retries are suppressed until identity changes |
 | `GATE_REFRESH_COOLDOWN_MS` | `30000` | Cooldown window (ms) between forced GitHub/catalog refreshes during a `403` burst |
-| `DNS_RESULT_ORDER` | `ipv4first` | DNS resolution order passed to `dns.setDefaultResultOrder` (`ipv4first`, `ipv6first`, `verbatim`) |
+| `DNS_RESULT_ORDER` | `ipv4first` | DNS resolution order passed to `dns.setDefaultResultOrder` (`ipv4first`, `ipv6first`, `verbatim`). Read by both `server.js` and `egress-proxy.js`: the gateway refuses IPv6 egress, so a pool member on a dual-stack host must not dial upstream over AAAA |
 | `TOOL_PROFILE_SCOPE` | `core` | `core` sends the minimal gate anchor (`read`, `shell`) on first attempt and escalates to `full` (all model-applicable tools) on retry; `full` sends the full tool profile on every request |
 | `OPENCODE_CHANNEL` | `latest` | OpenCode release channel (`latest`, `beta`, `dev`) |
 | `OPENCODE_MAJOR` | _(unset)_ | Pin a major version line (for example `2`) |

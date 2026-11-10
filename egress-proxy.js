@@ -24,6 +24,16 @@
 
 const net = require("net");
 const http = require("http");
+const dns = require("dns");
+
+// The free-tier gateway refuses IPv6 egress and accepts IPv4 (measured: the
+// same request from the same host answers 200 over IPv4 and
+// `429 FreeUsageLimitError` over IPv6). Bun's default order is `verbatim`,
+// which on a dual-stack host resolves `opencode.ai` to AAAA first, so a pool
+// member would tunnel every request out over the family the gateway refuses.
+// `server.js` sets the same order for its own fetches; this process dials the
+// upstream itself for every CONNECT, so it needs it too.
+dns.setDefaultResultOrder(process.env.DNS_RESULT_ORDER || "ipv4first");
 
 const PORT = parseInt(process.env.PORT || "8888", 10);
 const HOST = process.env.HOST || "127.0.0.1";

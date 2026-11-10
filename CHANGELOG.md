@@ -1,4 +1,45 @@
 # Changelog
+## [Unreleased]
+A pool member no longer burns its allowance over the address family the gateway refuses.
+
+The free tier refuses IPv6 egress and accepts IPv4: the same request, from the
+same host, answered `200` over IPv4 and `429 FreeUsageLimitError` over IPv6. Bun
+resolves in `verbatim` order by default, and every dual-stack host listed AAAA
+for `opencode.ai` first. `server.js` already pinned `ipv4first` for its own
+fetches, but `egress-proxy.js` dials the upstream itself for every CONNECT and
+did not — so a pool member tunnelled every request out over IPv6, was refused,
+and took the whole pool into a day-long cooldown. Six of eight members were
+unusable while their IPv4 addresses still had allowance.
+
+- `egress-proxy.js` calls `dns.setDefaultResultOrder(DNS_RESULT_ORDER || "ipv4first")`
+  at startup, matching `server.js`. Pool entries on dual-stack hosts now exit
+  over IPv4 and answer `200`.
+- The `Retry-After` cooldown above made this worse: a refusal recorded by the
+  IPv6 path parked the entry until the next daily reset, so the family could not
+  be re-tested until then.
+
+A spent egress stays spent, and a 429 no longer reaches the caller early.
+
+OpenCode resets the free allowance once a day and says so: a spent IP answers
+`429 FreeUsageLimitError` with `Retry-After: ~77415` (about 21.5 hours). The
+bridge ignored that header and parked the IP for `cooldownMs * 4` — 8 minutes —
+then backed off exponentially to a 30-minute cap. A spent IP therefore rejoined
+rotation every 8-30 minutes, was refused again, and burned one request on every
+probe. Under `failover`, which always returns `healthy[0]`, the same spent IP at
+the front of the pool was retried first while the rest of the pool idled.
+
+- `retryAfterMs(res)` reads `Retry-After` (delta-seconds or HTTP-date) and all
+  four 429 sites pass it as `cooldownMs`, so a spent entry leaves rotation until
+  the allowance actually returns. Missing or unparseable headers keep the old
+  fixed cooldown, so a gateway that omits the header cannot regress.
+- A 429 now walks the whole pool instead of failing over once. Two spent IPs at
+  the front used to hand the caller a 429 while six healthy IPs sat idle; now
+  every enabled member is tried and `429` only reaches the caller when the pool
+  is exhausted, which is the honest answer at that point.
+- Each refusal on the walk is recorded with that response's own `Retry-After`,
+  so a second spent IP is parked for its own reset window rather than the
+  default.
+- `proxy.js`: comment wording only (an upstream suspend, not a specific host).
 
 ## [Unreleased]
 

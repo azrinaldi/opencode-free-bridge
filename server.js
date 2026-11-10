@@ -486,6 +486,31 @@ async function egressFetch(url, init, state) {
 }
 
 /**
+ * Cooldown implied by an upstream `Retry-After` header, in milliseconds.
+ *
+ * A spent free-tier allowance answers 429 with `Retry-After` set to the seconds
+ * until the daily reset (observed ~77415s). Honouring it means a spent egress
+ * stays out of rotation until the allowance actually returns, instead of being
+ * retried every few minutes and burning a request on each attempt.
+ *
+ * Returns null when the header is missing or unparseable, so callers fall back
+ * to their previous fixed cooldown. Delta-seconds is the form upstream sends;
+ * an HTTP-date is also accepted because the header allows it.
+ */
+function retryAfterMs(res) {
+  const raw = res?.headers?.get?.("retry-after");
+  if (!raw) return null;
+  const text = String(raw).trim();
+  if (/^\d+$/.test(text)) {
+    const secs = parseInt(text, 10);
+    return secs > 0 ? secs * 1000 : null;
+  }
+  const at = Date.parse(text);
+  if (Number.isNaN(at)) return null;
+  const delta = at - Date.now();
+  return delta > 0 ? delta : null;
+}
+/**
  * Record a refusal against the egress that produced it.
  *
  * An empty URL is the `direct` pool entry, which is a real egress, so this
@@ -2341,23 +2366,46 @@ function handleRequest(req, res) {
         // shape were both accepted and only this IP's quota is gone, so the one
         // useful action is to spend the retry on a different IP instead of
         // replaying an identical request at an address upstream just refused.
-        // The cooldown is recorded either way, so the next request also moves.
+        //
+        // This walks the pool rather than failing over once. A single retry was
+        // not enough: two spent IPs at the front handed the client a 429 while
+        // the rest of the pool was healthy. The client should only see 429 when
+        // every enabled member has been refused in this request — at that point
+        // there is genuinely nothing left to try, and saying so is correct.
         if (!upstreamRes.ok && upstreamRes.status === 429) {
           const poolState = proxy.describe().pool;
           const canFailover = poolState && poolState.active && poolState.enabled > 1;
           recordEgressFailure(egressState, {
             reason: "allowance 429",
-            cooldownMs: poolState ? poolState.cooldownMs * 4 : null,
+            cooldownMs: retryAfterMs(upstreamRes) ?? (poolState ? poolState.cooldownMs * 4 : null),
           });
+
           if (canFailover) {
-            const next = proxy.pick({ exclude: egressState.egressUrl });
-            if (next.url !== egressState.egressUrl) {
+            // Every egress already refused for *this* request. `pick()` skips
+            // cooling entries, but a just-recorded failure is cooling too, so
+            // this also prevents revisiting one. The cap guards a pool whose
+            // entries resolve to the same URL.
+            const tried = new Set();
+            if (egressState.egressUrl !== null && egressState.egressUrl !== undefined) {
+              tried.add(egressState.egressUrl);
+            }
+            const MAX = Math.max(2, poolState.enabled);
+
+            for (let attempt = 0; attempt < MAX; attempt += 1) {
+              // pick() excludes one entry, not a list. Pass the one we just
+              // refused; it is also in cooldown now, so this is redundant
+              // rather than load-bearing — which is the point.
+              const next = proxy.pick({ exclude: egressState.egressUrl });
+              const key = next.url === null || next.url === undefined ? "@direct" : next.url;
+              if (tried.has(key)) break;
+              tried.add(key);
+
               console.warn(
                 `[opencode-free-bridge] Egress ${
                   proxy.displayHost(egressState.egressUrl) || "direct"
-                } is out of allowance (429); retrying through ${
+                } is out of allowance (429); trying ${
                   proxy.displayHost(next.url) || "direct"
-                }`
+                } (${tried.size}/${poolState.enabled})`
               );
               egressState.egress = next;
               egressState.egressUrl = next.url;
@@ -2368,14 +2416,21 @@ function handleRequest(req, res) {
                 signal: abortController.signal,
               }, egressState);
               consumedErrorText = null;
-              // The retry may have landed on a second spent IP. Record it too,
-              // or the next request would pick it again and learn the same thing.
-              if (upstreamRes.status === 429) {
-                recordEgressFailure(egressState, {
-                  reason: "allowance 429",
-                  cooldownMs: poolState.cooldownMs * 4,
-                });
-              }
+
+              if (upstreamRes.status !== 429) break;
+
+              // Still spent. Record with this response's own Retry-After so the
+              // entry leaves rotation for the real reset window.
+              recordEgressFailure(egressState, {
+                reason: "allowance 429",
+                cooldownMs: retryAfterMs(upstreamRes) ?? poolState.cooldownMs * 4,
+              });
+            }
+
+            if (upstreamRes.status === 429) {
+              console.warn(
+                `[opencode-free-bridge] All ${tried.size} pooled egress(es) refused this request; exhausted the pool, returning 429`
+              );
             }
           }
         }
@@ -2540,7 +2595,7 @@ function handleRequest(req, res) {
             if (canFailover && egressState.egressUrl) {
               proxy.markFailure(egressState.egressUrl, {
                 reason: `gate ${gateStatus}`,
-                cooldownMs: gateStatus === 429 ? pooled.cooldownMs * 4 : null,
+                cooldownMs: gateStatus === 429 ? (retryAfterMs(upstreamRes) ?? pooled.cooldownMs * 4) : null,
               });
               const next = proxy.pick({ exclude: egressState.egressUrl });
               if (next.url && next.url !== egressState.egressUrl) {
@@ -2662,7 +2717,7 @@ function handleRequest(req, res) {
             // fully separate from a shape problem.
             recordEgressFailure(egressState, {
               reason: capacity ? "allowance 429" : `gate ${retryStatus}`,
-              cooldownMs: capacity ? proxy.describe().pool.cooldownMs * 4 : null,
+              cooldownMs: capacity ? (retryAfterMs(upstreamRes) ?? proxy.describe().pool.cooldownMs * 4) : null,
             });
 
             // The gate answers the same `403 FreeTierError` for a blocked egress
@@ -3370,6 +3425,7 @@ module.exports = {
   __getGateDiagnostic: () => lastGateDiagnostic,
   __getLastUpstreamError: () => lastUpstreamError,
   __auditGateShape: auditGateShape,
+  __retryAfterMs: retryAfterMs,
   gateSafeUserAgent,
   DISCOVERY_TTL_MS,
   CLI_VERSION_TTL_MS,
