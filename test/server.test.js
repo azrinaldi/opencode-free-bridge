@@ -639,10 +639,12 @@ describe("server unit & integration tests", () => {
       }
     });
 
-    it("lets the catalog, not the model's name, decide what is free", async () => {
-      // The gateway's /models list is not the authority: it can still list a
-      // model the catalog marks deprecated, and it can omit one the catalog
-      // calls free. Naming (`-free`) is a convention, not a price.
+    it("advertises what the gateway serves, priced by the gateway", async () => {
+      // The gateway's /models list is now the live authority: an id it omits is
+      // retired, and advertising it sends clients into a 404 that burns their
+      // per-IP burst quota. The catalog still rules ids the gateway does list
+      // (paid stays out, deprecated drops), and its `status` field is corrected
+      // by the gateway's own price through `applyGatewayPricing`.
       const realGetFree = identity.getFreeModels;
       const realVerdict = identity.getCatalogVerdict;
       identity.getFreeModels = () => ["glm-5.3-flash-free", "nemotron-3-ultra-free"];
@@ -670,7 +672,10 @@ describe("server unit & integration tests", () => {
         await discoverModels();
         const ids = __getDiscoveryState().activeModels.map((m) => m.id);
         assert.ok(ids.includes("glm-5.3-flash-free"));
-        assert.ok(ids.includes("nemotron-3-ultra-free"), "catalog-free survives /models omitting it");
+        assert.ok(
+          !ids.includes("nemotron-3-ultra-free"),
+          "a catalog-free id the gateway no longer serves must drop, not be advertised into a 404"
+        );
         assert.ok(ids.includes("some-new-free"), "an id the catalog does not describe keeps the name heuristic");
         assert.ok(!ids.includes("cat-jam-free"), "a deprecated model drops even though /models lists it");
         assert.ok(!ids.includes("jev-1.13-free"));

@@ -1,4 +1,39 @@
 # Changelog
+## [2.3.2] — 2026-11-10
+
+A rotated address clears the cooldown its predecessor earned, and an
+all-cooling pool stops spending requests it knows will be refused.
+
+The free allowance is keyed to the address upstream sees, not to the URL of the
+proxy in front of it. A phone on mobile data rotates that address several times
+a day, and every rotation hands back a fresh allowance — but the pool tracked
+health per proxy URL, so a `Retry-After` of 13 hours (measured: `47674s`, the
+next midnight UTC) kept the phone parked long after the address that earned the
+refusal was gone. Measured on a live pool: the phone answered `200` on six
+consecutive requests while `/health` still reported it cooling with 13.7 hours
+left, and the bridge returned `429` to the client because every member looked
+spent. The other three members really were spent; the phone was not.
+
+- The recovery watchdog now reads each parked entry's exit address from
+  `cdn-cgi/trace` and clears the cooldown when it changes, because a new address
+  means a new allowance. The address is persisted in `pool-health.json`, so a
+  restart mid-cooldown can still notice the rotation instead of trusting stale
+  evidence. `proxy.recoveryProbeTick()` runs once a minute.
+- A 429 no longer walks a pool whose members are all cooling. `pick()` reports
+  `cooling: true` when nothing is ready; walking the pool then spends one
+  request per entry on upstreams that already refused each of them, which is how
+  an egress that served nothing that day still accumulated failures and got
+  stamped with a fresh 429.
+- The caller now receives upstream's real `Retry-After` on a capacity 429. That
+  path is a passthrough, not the gate branch, so the header was dropped and
+  clients retried immediately into a still-spent pool.
+- `priority-failover` strategy and the per-egress usage meter (`meter: false`
+  opts an entry out) are now in `main` rather than only on the deployment.
+- Gateway price list reconciles the catalog verdicts: an id the gateway serves
+  at zero price is free even when the catalog still marks it deprecated, and a
+  catalog-free id the gateway has stopped serving is no longer advertised —
+  it sent clients into a 404 that burned their burst quota.
+
 ## [Unreleased]
 A pool member no longer burns its allowance over the address family the gateway refuses.
 

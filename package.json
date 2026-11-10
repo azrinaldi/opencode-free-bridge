@@ -1,6 +1,6 @@
 {
   "name": "opencode-free-bridge",
-  "version": "2.3.1",
+  "version": "2.3.2",
   "description": "OpenAI-compatible bridge to OpenCode free-tier models (no account required), self-adapting to gate changes",
   "main": "server.js",
   "bin": {

@@ -40,7 +40,7 @@ const ENV_OVERRIDE = "UPSTREAM_PROXY_URL";
 const POOL_ENV = "UPSTREAM_PROXY_POOL";
 const STRATEGY_ENV = "UPSTREAM_PROXY_STRATEGY";
 
-const STRATEGIES = new Set(["round-robin", "failover", "random"]);
+const STRATEGIES = new Set(["round-robin", "failover", "random", "priority-failover"]);
 const DEFAULT_STRATEGY = "round-robin";
 const DEFAULT_COOLDOWN_MS = 120000;
 const DEFAULT_MAX_COOLDOWN_MS = 1800000;
@@ -148,6 +148,10 @@ function parsePoolEntry(raw, index) {
         direct: true,
         enabled: source.enabled === undefined ? true : Boolean(source.enabled),
         weight: Number.isFinite(weight) && weight > 0 ? Math.min(weight, 100) : 1,
+        // meter: false opts an entry out of usage accounting — meant for
+        // entries whose traffic is not scarce (VPS egress), keeping usage.json
+        // focused on the entries that cost real money, e.g. phone data.
+        meter: source.meter === undefined ? true : Boolean(source.meter),
       },
     };
   }
@@ -169,6 +173,7 @@ function parsePoolEntry(raw, index) {
       direct: false,
       enabled: source.enabled === undefined ? true : Boolean(source.enabled),
       weight: Number.isFinite(weight) && weight > 0 ? Math.min(weight, 100) : 1,
+      meter: source.meter === undefined ? true : Boolean(source.meter),
     },
   };
 }
@@ -211,6 +216,13 @@ let cooldowns = { baseMs: DEFAULT_COOLDOWN_MS, maxMs: DEFAULT_MAX_COOLDOWN_MS };
  */
 function keyOf(url) {
   return url ? url : "@direct";
+}
+/** Usage accounting gate: false skips an entry flagged `meter: false` in config. */
+function shouldMeter(url) {
+  const entry = url
+    ? pool.entries.find((e) => e.url === url)
+    : pool.entries.find((e) => e.direct);
+  return entry ? entry.meter !== false : true;
 }
 
 /** key -> { failures, cooldownUntil, lastError, lastOkAt, lastUsedAt } */
@@ -273,6 +285,10 @@ function healthSnapshot(now = Date.now()) {
       lastStatus: h.lastStatus,
       lastOkAt: h.lastOkAt || null,
       lastUsedAt: h.lastUsedAt || null,
+      // The address this cooldown belongs to. Without it a restart cannot tell
+      // a still-spent IP from one that has already rotated to a fresh
+      // allowance, and would keep the entry parked on stale evidence.
+      exitIp: exitIpByKey.get(key) || null,
     })),
   };
 }
@@ -379,6 +395,7 @@ function restoreHealth(entries, now = Date.now()) {
       lastUsedAt: Number.isFinite(Number(record.lastUsedAt)) ? Number(record.lastUsedAt) : 0,
       lastStatus: typeof record.lastStatus === "string" ? record.lastStatus : null,
     });
+    if (typeof record.exitIp === "string" && record.exitIp) exitIpByKey.set(key, record.exitIp);
     restored += 1;
   }
   return restored;
@@ -536,6 +553,14 @@ function pick({ exclude = null, now = Date.now() } = {}) {
           break;
         }
       }
+    } else if (pool.strategy === "priority-failover") {
+      // Config order IS the priority: entry #1 (the renewable phone IP) is
+      // preferred while healthy. Failover and recovery are both just health
+      // moving: a 429 cools the phone and the next entry serves; the priority
+      // watchdog probes cooling entries in the background and clears the
+      // cooldown the moment one answers 200, so the next pick() snaps back to
+      // the top without spending a real request.
+      chosen = healthy[0];
     } else if (pool.strategy === "failover") {
       // Sticky: keep using the first healthy entry, which preserves upstream
       // prompt caching on that IP until it is throttled.
@@ -841,7 +866,138 @@ function withProxy(init, egressUrl = null) {
 
 /** fetch() through the resolved egress. The single egress entry point. */
 function netFetch(url, init, egressUrl = null) {
-  return fetch(url, withProxy(init, egressUrl));
+  const metering = shouldMeter(egressUrl);
+  const body = init?.body;
+  const requestBytes =
+    typeof body === "string"
+      ? Buffer.byteLength(body)
+      : body && body.byteLength
+        ? body.byteLength
+        : 0;
+  return fetch(url, withProxy(init, egressUrl)).then((res) => {
+    if (metering) recordUsage(egressUrl, requestBytes, 0, { ok: res.ok && res.status < 400 });
+    // Count response bytes as the stream is read: the response is always SSE
+    // here, so wrapping the reader catches every payload without buffering it.
+    if (metering && res.body && typeof res.body.getReader === "function") {
+      const origGetReader = res.body.getReader.bind(res.body);
+      let counted = false;
+      res.body.getReader = () => {
+        if (counted) return origGetReader();
+        counted = true;
+        const reader = origGetReader();
+        const origRead = reader.read.bind(reader);
+        reader.read = () =>
+          origRead().then((chunk) => {
+            if (chunk && chunk.value && chunk.value.byteLength) {
+              loadUsage();
+              const e = usageEntry(keyOf(egressUrl));
+              e.responseBytes += chunk.value.byteLength;
+              persistUsage();
+            }
+            return chunk;
+          });
+        return reader;
+      };
+    }
+    return res;
+  });
+}
+
+// ------------------------------------------------------------- usage meter ---
+
+/**
+ * Per-egress traffic accounting, persisted to usage.json beside the config.
+ *
+ * The point is phone data: when the egress is the Android phone over Tailscale,
+ * every upstream byte is mobile data. Requests and response bytes are counted
+ * here rather than derived from tokens because the wire carries headers, SSE
+ * framing, and identity payloads that tokens do not describe. The bridge hands
+ * the same numbers to OpenBot in `usage` (chat requests) and `/health`, so a
+ * token-to-data ratio can be computed from one place.
+ */
+const USAGE_FILE_NAME = "usage.json";
+function usageFile() {
+  return path.join(stateDir(), USAGE_FILE_NAME);
+}
+let usage = {
+  // day = UTC date string; rolls when a request lands on a new day.
+  day: new Date().toISOString().slice(0, 10),
+  perEgress: {}, // key -> { requests, okRequests, requestBytes, responseBytes, promptTokens, completionTokens }
+};
+let usageLoaded = false;
+
+function usageEntry(key) {
+  const today = new Date().toISOString().slice(0, 10);
+  if (today !== usage.day) {
+    usage = { day: today, perEgress: {} };
+    persistUsage();
+  }
+  if (!usage.perEgress[key]) {
+    usage.perEgress[key] = {
+      requests: 0,
+      okRequests: 0,
+      requestBytes: 0,
+      responseBytes: 0,
+      promptTokens: 0,
+      completionTokens: 0,
+    };
+  }
+  return usage.perEgress[key];
+}
+
+function loadUsage() {
+  if (usageLoaded) return;
+  usageLoaded = true;
+  try {
+    const json = JSON.parse(fs.readFileSync(usageFile(), "utf8"));
+    if (json && typeof json.day === "string" && json.perEgress && typeof json.perEgress === "object") {
+      if (json.day === new Date().toISOString().slice(0, 10)) usage = { day: json.day, perEgress: json.perEgress };
+    }
+  } catch {}
+}
+
+function persistUsage() {
+  try {
+    fs.mkdirSync(path.dirname(usageFile()), { recursive: true });
+    fs.writeFileSync(usageFile(), `${JSON.stringify(usage, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+  } catch {}
+}
+
+/** Record one wire transaction through an egress. Coarse, by design. */
+function recordUsage(egressUrl, requestBytes, responseBytes, { ok = false, promptTokens = 0, completionTokens = 0 } = {}) {
+  // Entries flagged `meter: false` in proxy.json stay out of usage.json —
+  // the accounting exists for scarce links (phone data), not free ones.
+  if (!shouldMeter(egressUrl)) return;
+  // null/undefined means the direct entry; keyOf maps it to "@direct" so
+  // direct traffic is accounted too, not silently dropped.
+  loadUsage();
+  const e = usageEntry(keyOf(egressUrl));
+  e.requests += 1;
+  e.requestBytes += Math.max(0, Math.round(requestBytes) || 0);
+  e.responseBytes += Math.max(0, Math.round(responseBytes) || 0);
+  if (ok) {
+    e.okRequests += 1;
+    e.promptTokens += Math.max(0, Math.round(promptTokens) || 0);
+    e.completionTokens += Math.max(0, Math.round(completionTokens) || 0);
+  }
+  persistUsage();
+}
+
+/** Read view for /health and tests; adds derived MB and token/data ratio. */
+function describeUsage() {
+  loadUsage();
+  const out = { day: usage.day, perEgress: {} };
+  for (const [key, e] of Object.entries(usage.perEgress)) {
+    const mb = (e.requestBytes + e.responseBytes) / 1_000_000;
+    const tokens = e.promptTokens + e.completionTokens;
+    out.perEgress[key] = {
+      ...e,
+      label: healthLabel(key),
+      totalMB: Math.round(mb * 100) / 100,
+      tokensPerMB: mb > 0.01 ? Math.round(tokens / mb) : null,
+    };
+  }
+  return out;
 }
 
 /**
@@ -940,6 +1096,102 @@ async function probeExitIp(proxyUrl, timeoutMs) {
   }
 }
 
+/**
+ * Priority-failover recovery watchdog.
+ *
+ * Config order is priority. When a high-priority egress (the renewable phone
+ * IP) is parked by a 429 and lower-priority entries are serving, a plain
+ * "cooldown expiry" model only puts the phone back in the candidate list —
+ * but `pick()` sticks to the first *healthy* entry, so it would not actually
+ * return to the top until the serving entry also fails. This watchdog probes
+ * a cooling entry once its cooldown has fully elapsed: one cheap
+ * GET /v1/models through that egress. 200 clears the cooldown via
+ * `markSuccess`, so the next `pick()` snaps back to the top entry; anything
+ * else re-parks it with a fresh backoff. The walk order is the pool order,
+ * so the highest-priority entry always recovers first.
+ */
+const RECOVERY_PROBE_INTERVAL_MS = 60_000;
+/**
+ * Last exit IP seen per egress key.
+ *
+ * Upstream keys the free allowance to the address it sees, not to the URL of
+ * the proxy in front of it. A phone on mobile data rotates its address several
+ * times a day, and every rotation hands back a fresh allowance — but the pool
+ * only knew the proxy URL, so a `Retry-After` of 13 hours (measured: 47674s,
+ * i.e. the next midnight UTC) kept the phone parked long after its address,
+ * and with it the refusal, was gone. That is why a healthy entry could sit
+ * cooling all day while the same URL answered 200 in a burst test.
+ *
+ * So an exit-IP change is treated as evidence the refusal no longer applies:
+ * the cooldown is cleared and the entry returns to the pool. The mapping is
+ * also persisted in the health file so a restart mid-cooldown can still notice
+ * the rotation instead of trusting a stale park.
+ */
+const exitIpByKey = new Map();
+let recoveryProbeBusy = false;
+async function recoveryProbeTick() {
+  if (recoveryProbeBusy) return;
+  if (pool.strategy !== "priority-failover" || pool.entries.length === 0) return;
+  recoveryProbeBusy = true;
+  const now = Date.now();
+  try {
+    const active = activeEntries();
+    // Address rotation outranks the cooldown clock: check the highest-priority
+    // parked entry whose exit address is still worth re-reading. One probe per
+    // tick, so the cost is a single trace request per minute at worst.
+    const parked = active.find((e) => {
+      const h = health.get(keyOf(e.url));
+      return h && h.cooldownUntil > now;
+    });
+    if (parked) {
+      const key = keyOf(parked.url);
+      const seen = exitIpByKey.get(key);
+      const exit = await probeExitIp(parked.url || null, 8_000);
+      if (exit && exit.ip) {
+        if (seen && seen !== exit.ip) {
+          console.log(
+            `[opencode-free-bridge] Egress ${displayHost(parked.url) || "direct"} rotated ${seen} -> ${exit.ip}; clearing the cooldown that IP earned`
+          );
+          exitIpByKey.set(key, exit.ip);
+          markSuccess(parked.url);
+          return;
+        }
+        if (!seen) exitIpByKey.set(key, exit.ip);
+      }
+    }
+    // Walk the pool in priority order and probe the first entry whose
+    // cooldown has fully elapsed. One probe per tick keeps the cost at one
+    // models call per minute, worst case.
+    const candidates = active.filter((e) => {
+      const h = health.get(keyOf(e.url));
+      return h && h.cooldownUntil > 0 && h.cooldownUntil <= now;
+    });
+    const entry = candidates[0];
+    if (!entry) return;
+    const before = health.get(keyOf(entry.url));
+    if (before) before.cooldownUntil = now + RECOVERY_PROBE_INTERVAL_MS; // hold position during probe
+    const probeUrl = process.env.OPENCODE_MODELS_URL || "https://opencode.ai/inference/v1/models";
+    try {
+      const res = await netFetch(probeUrl, {
+        headers: { Authorization: "Bearer public" },
+        signal: AbortSignal.timeout(10_000),
+      }, entry.url || null);
+      if (res.status === 200) {
+        console.log(
+          `[opencode-free-bridge] Priority egress ${displayHost(entry.url) || "direct"} recovered (probe 200); returning to top of pool`
+        );
+        markSuccess(entry.url);
+      } else {
+        markFailure(entry.url, { reason: `recovery probe ${res.status}` });
+      }
+    } catch (err) {
+      markFailure(entry.url, { reason: `recovery probe transport: ${err.message}`.slice(0, 200) });
+    }
+  } finally {
+    recoveryProbeBusy = false;
+  }
+}
+
 loadFromDisk();
 
 module.exports = {
@@ -965,6 +1217,12 @@ module.exports = {
   netFetch,
   testProxy,
   testPool,
+  recoveryProbeTick,
+  recordUsage,
+  describeUsage,
+  get strategy() {
+    return pool.strategy;
+  },
   __setForTest(state) {
     current = state;
   },

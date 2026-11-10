@@ -733,12 +733,20 @@ async function discoverModels() {
     const json = await res.json();
     const items = json.data || [];
 
-    // The provider catalog decides what is free — it is the file the CLI reads
-    // at boot, and its `cost`/`status` fields are facts about the plan. The
-    // gateway's /models list only contributes models the catalog does not
-    // describe (a few evaluator entries), because a name is not a price: a
-    // model named `-free` that the catalog marks deprecated must drop out, and
-    // one the catalog marks free must survive /models omitting it.
+    // The gateway is the live source of truth: its /models entries carry the
+    // price applied right now (`cost.text.input/output.price`), and an id it
+    // stopped serving disappears from the list. The provider catalog still
+    // supplies families, reasoning flags and endpoints, but its `status` field
+    // lags — it kept `minimax-m3.1-flash-free` marked deprecated after upstream
+    // was already serving it free. So the gateway's price is reconciled into the
+    // verdicts first, and only an unknown price falls back to the catalog's
+    // ruling (or, before the first catalog read, to the `-free` suffix).
+    const promoted = identity.applyGatewayPricing(items);
+    if (promoted.length > 0) {
+      console.log(
+        `[opencode-free-bridge] Gateway price list re-ruled: ${promoted.slice(0, 6).join(", ")}${promoted.length > 6 ? ` (+${promoted.length - 6})` : ""}`
+      );
+    }
     const ownedBy = new Map(items.map((i) => [String(i.id || "").toLowerCase(), i]));
     const kept = [];
     const seen = new Set();
@@ -748,20 +756,21 @@ async function discoverModels() {
       seen.add(lower);
       kept.push(id);
     };
-
-    for (const id of identity.getFreeModels()) keep(id);
-    // With the catalog loaded this loop adds nothing today: every id /models
-    // offers is either described by the catalog (already ruled on) or is an
-    // evaluator entry. It exists for the window before the first catalog read,
-    // when the name is the only signal available — a bridge that answers
-    // /v1/models with an empty list for the first seconds after boot is worse
-    // than one that guesses and corrects itself on the next refresh.
+    // Only ids the gateway is serving right now are advertised: a catalog-free
+    // model missing from /models is retired, and advertising it sends clients
+    // into a 404 that burns their per-IP burst quota.
     for (const item of items) {
       const id = String(item.id || "");
       const lower = id.toLowerCase();
       if (lower.startsWith("jev-")) continue; // systemone evaluator models
       const verdict = identity.getCatalogVerdict(lower);
-      if (verdict) continue; // the catalog already ruled on this id
+      if (verdict === "free") {
+        keep(id);
+        continue;
+      }
+      if (verdict) continue; // paid or deprecated, and the gateway agrees
+      // No ruling at all: the catalog has not been read yet in this process.
+      // Guess from the name, then correct itself on the next refresh.
       if (!lower.endsWith("-free") && !lower.includes("-contributor") && lower !== "big-pickle") continue;
       keep(id);
     }
@@ -2017,6 +2026,10 @@ function handleRequest(req, res) {
     res.writeHead(200, { "Content-Type": "application/json" });
     const idState = identity.getState();
     const proxyState = proxy.describe();
+    let usageView = null;
+    try {
+      usageView = proxy.describeUsage();
+    } catch {}
     const gateThrottled =
       lastFailedGateRetryTime > 0 &&
       Date.now() - lastFailedGateRetryTime < GATE_RETRY_COOLDOWN_MS &&
@@ -2044,6 +2057,9 @@ function handleRequest(req, res) {
                   : "direct",
           ...(UPSTREAM_RELAY_URL ? { relay: relayLabel(UPSTREAM_RELAY_URL) } : {}),
           proxy: proxyState,
+          // Per-egress wire traffic and token accounting (usage.json). The
+          // phone entry here is the mobile-data cost of the bridge today.
+          ...(usageView ? { usage: usageView } : {}),
         },
         identity: {
           userAgent: idState.userAgent,
@@ -2396,6 +2412,19 @@ function handleRequest(req, res) {
               // refused; it is also in cooldown now, so this is redundant
               // rather than load-bearing — which is the point.
               const next = proxy.pick({ exclude: egressState.egressUrl });
+              // `cooling` means pick() found no ready candidate at all: every
+              // member is already parked by an earlier request. Walking the pool
+              // then spends one request per entry on an upstream that has
+              // already refused each of them, which is exactly how an egress
+              // that served nothing today still accumulates failures and gets
+              // stamped with a fresh 429. Nothing healthy is left to try, so
+              // fail fast and let Retry-After carry the wait instead.
+              if (next.cooling) {
+                console.warn(
+                  `[opencode-free-bridge] Pool has no ready egress (${poolState.enabled} enabled, all cooling); not walking it`
+                );
+                break;
+              }
               const key = next.url === null || next.url === undefined ? "@direct" : next.url;
               if (tried.has(key)) break;
               tried.add(key);
@@ -2544,6 +2573,20 @@ function handleRequest(req, res) {
             const errHeaders = { "Content-Type": "application/json" };
             if (upstreamLogId) errHeaders["X-OpenCode-Log-Id"] = upstreamLogId;
             if (upstreamRes.status >= 500) errHeaders["X-OpenCode-Gate"] = "upstream-error";
+            // A capacity 429 reaches this passthrough, not the gate branch:
+            // isFreeTierCliGateError() only claims 403/401/426, so FreeUsageLimitError
+            // with status 429 falls through to here. Without the real Retry-After
+            // the client retries immediately into a pool that is still spent, and
+            // every retry re-stamps the entries. Upstream sends the free-allowance
+            // reset as an absolute boundary (measured: ~46ks, i.e. next midnight
+            // UTC), so passing it through is what makes the wait truthful.
+            if (upstreamRes.status === 429) {
+              const upstreamRetryAfter = retryAfterMs(upstreamRes);
+              if (upstreamRetryAfter) {
+                errHeaders["Retry-After"] = String(Math.max(1, Math.ceil(upstreamRetryAfter / 1000)));
+              }
+              errHeaders["X-OpenCode-Gate"] = "ip-throttled";
+            }
             res.writeHead(upstreamRes.status, errHeaders);
             return res.end(
               JSON.stringify({
@@ -3364,6 +3407,10 @@ if (require.main === module) {
   // IDENTITY does not: it is refreshed lazily from the request path (see
   // identity.ensureFresh), so an idle bridge makes no network calls at all.
   setInterval(discoverModels, DISCOVERY_TTL_MS).unref();
+  // Priority-failover recovery: probe one cooling entry per minute so the
+  // highest-priority egress (the renewable phone IP) returns to the top of the
+  // pool as soon as it answers again, instead of only after its cooldown.
+  setInterval(() => proxy.recoveryProbeTick().catch(() => {}), 60_000).unref();
 }
 
 module.exports = {

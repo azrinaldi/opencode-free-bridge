@@ -282,6 +282,9 @@ let modelEndpoints = {};
 let freeModels = [];
 // id → "free" | "paid" | "deprecated", straight from the provider catalog.
 let catalogVerdicts = {};
+// Kee 2026-11-10: upstream still serves these ids on the free tier while the
+// catalog marks them deprecated. Keep them exposed; a priced entry stays out.
+const FREE_VERDICT_OVERRIDES = Object.freeze(["minimax-m3.1-flash-free"]);
 // catalog family → a free model id in that family (e.g. "nemotron-free").
 let modelFamilies = {};
 // id → { reasoning: boolean, maxOutput: number|null } from the catalog.
@@ -1217,6 +1220,13 @@ function parseCatalogData(json) {
         reasoning: m.reasoning,
         maxOutput: Number(m?.limit?.output) > 0 ? Number(m.limit.output) : null,
       };
+    }
+  }
+  for (const id of FREE_VERDICT_OVERRIDES) {
+    const key = id.toLowerCase();
+    if (verdicts[key] === "deprecated") {
+      verdicts[key] = "free";
+      if (!freeModels.includes(id)) freeModels.push(id);
     }
   }
   if (freeModels.length > 0) out.freeModels = freeModels;
@@ -2276,6 +2286,56 @@ function getCatalogVerdict(modelId) {
   return catalogVerdicts[String(modelId || "").toLowerCase()];
 }
 
+/**
+ * Reconcile the verdicts with the gateway's own price list.
+ *
+ * The provider catalog lags the serving side: it kept
+ * `minimax-m3.1-flash-free` marked `deprecated` after upstream had already
+ * started serving it, which needed a hand-written override to undo. The
+ * gateway's `/models` entries carry `cost.text.input.price` and
+ * `cost.text.output.price` — the price applied to a request right now — and
+ * retired ids disappear from that list entirely. So a zero price there wins
+ * over a stale catalog verdict in both directions: a deprecated-but-zero id
+ * becomes free, and a catalog-free id the gateway now prices above zero stops
+ * being advertised instead of failing upstream.
+ *
+ * An entry without a text price block (image/video-only model) changes nothing;
+ * its catalog verdict stands rather than guessing a price from its name.
+ * Returns the ids whose verdict moved, for logging.
+ */
+function applyGatewayPricing(models) {
+  if (!Array.isArray(models)) return [];
+  const changed = [];
+  for (const m of models) {
+    const id = String(m?.id || "").trim();
+    const key = id.toLowerCase();
+    if (!key) continue;
+    const text = m?.cost?.text;
+    const inPrice = Number(text?.input?.price);
+    const outPrice = Number(text?.output?.price);
+    if (!Number.isFinite(inPrice) || !Number.isFinite(outPrice)) continue;
+    const free = inPrice === 0 && outPrice === 0;
+    if (free) {
+      if (catalogVerdicts[key] !== "free") {
+        catalogVerdicts[key] = "free";
+        changed.push(key);
+      }
+      if (!freeModels.some((n) => String(n).toLowerCase() === key)) freeModels.push(id);
+    } else if (catalogVerdicts[key] === "free") {
+      catalogVerdicts[key] = "paid";
+      freeModels = freeModels.filter((n) => String(n).toLowerCase() !== key);
+      changed.push(key);
+    }
+  }
+  if (changed.length > 0) {
+    // Keep the derived aliases honest for the ids that moved.
+    for (const [family, id] of Object.entries(modelFamilies)) {
+      if (catalogVerdicts[String(id).toLowerCase()] !== "free") delete modelFamilies[family];
+    }
+  }
+  return changed;
+}
+
 function getEndpoints(modelId = null) {
   const base = {
     chatUrl: recipe.chatUrl,
@@ -2606,6 +2666,7 @@ module.exports = {
   getToolNames,
   getFreeModels,
   getCatalogVerdict,
+  applyGatewayPricing,
   getModelFacts,
   applyToolOverrides,
   resolveModelAlias,

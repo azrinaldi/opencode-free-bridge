@@ -457,6 +457,42 @@ describe("egress pool", () => {
     assert.equal(proxy.markFailure("http://a:1").backoffMs, 1000);
   });
 
+  it("clears a long cooldown when the egress address has rotated", async () => {
+    // The free allowance is keyed to the address upstream sees, not to the
+    // proxy URL. A phone on mobile data rotates that address several times a
+    // day, so a 13-hour Retry-After must not outlive the IP that earned it.
+    if (typeof Bun === "undefined") return;
+    proxy.setPool({
+      entries: [{ id: "phone", url: "http://127.0.0.1:9911" }],
+      strategy: "priority-failover",
+      cooldownMs: 60_000,
+      maxCooldownMs: 1_800_000,
+    });
+    // 13 hours: the real Retry-After measured on a spent allowance.
+    proxy.markFailure("http://127.0.0.1:9911", { reason: "allowance 429", cooldownMs: 47_000_000 });
+    assert.equal(proxy.describe().pool.entries[0].state, "cooling");
+
+    const original = global.fetch;
+    try {
+      let exit = "203.0.113.9";
+      global.fetch = async (url) => {
+        if (String(url).includes("cdn-cgi/trace")) return { ok: true, text: async () => `ip=${exit}\n` };
+        return { ok: true, status: 200 };
+      };
+      // First tick learns the address that earned the cooldown.
+      await proxy.recoveryProbeTick();
+      assert.equal(proxy.describe().pool.entries[0].state, "cooling", "same IP must stay parked");
+
+      // The phone rotates: a different address means a fresh allowance.
+      exit = "198.51.100.7";
+      await proxy.recoveryProbeTick();
+      const entry = proxy.describe().pool.entries[0];
+      assert.equal(entry.state, "ready", "an address change must clear the old cooldown");
+      assert.equal(entry.failures, 0);
+    } finally {
+      global.fetch = original;
+    }
+  });
   it("still sends through the least-cooling entry when every entry is throttled", () => {
     proxy.setPool({ entries: ["http://a:1", "http://b:2"] });
     proxy.markFailure("http://a:1", { reason: "gate 429", cooldownMs: 9000 });

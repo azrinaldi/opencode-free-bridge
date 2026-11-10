@@ -267,6 +267,10 @@ async function load() {
     // entry; credentials never round-trip through the panel.
     const poolState = state.pool || {};
     $("pool-entries").value = poolEntriesToText(poolState);
+    // Reset the select first: an unknown strategy from a newer release must
+    // not leave the select stuck on a stale option, and an existing selection
+    // survives because setting an invalid value makes .value empty.
+    $("pool-strategy").value = "";
     $("pool-strategy").value = poolState.strategy || "round-robin";
 
     locked = state.locked;
@@ -461,6 +465,7 @@ function renderPanel(description, { version = "", port = "" } = {}) {
     <div class="field">
       <label for="pool-strategy">Strategi</label>
       <select id="pool-strategy">
+        <option value="priority-failover">Prioritas + failover (utamakan urutan atas, balik otomatis)</option>
         <option value="round-robin">Round-robin (sebar rata)</option>
         <option value="failover">Failover (pakai yang pertama sampai ditolak)</option>
         <option value="random">Acak berbobot</option>
