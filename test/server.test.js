@@ -99,8 +99,11 @@ describe("server unit & integration tests", () => {
     const { identity } = require("../server");
     const canDerive = Boolean(identity.resolveModelAlias("mimo"));
     if (canDerive) {
-      assert.equal(normalizeModel("zen/mimo"), "mimo-v2.6-flash-free");
-      assert.equal(normalizeModel("opencode/longcat"), "longcat-2.5-preview-free");
+      // Assert the family, not an exact id: the gateway renames its revisions
+      // (`longcat-2.5-preview-free` became `longcat-2.5-free`) without notice,
+      // and a hardcoded id turns that ordinary upstream edit into a red CI.
+      assert.match(normalizeModel("zen/mimo"), /^mimo-/);
+      assert.match(normalizeModel("opencode/longcat"), /^longcat-/);
     } else {
       assert.equal(normalizeModel("zen/mimo"), "mimo");
       assert.equal(normalizeModel("opencode/longcat"), "longcat");

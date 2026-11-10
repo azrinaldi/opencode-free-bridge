@@ -33,7 +33,27 @@ const dns = require("dns");
 // member would tunnel every request out over the family the gateway refuses.
 // `server.js` sets the same order for its own fetches; this process dials the
 // upstream itself for every CONNECT, so it needs it too.
-dns.setDefaultResultOrder(process.env.DNS_RESULT_ORDER || "ipv4first");
+//
+// `ipv6first` only exists from Node 22. Calling setDefaultResultOrder with an
+// order the runtime does not know throws ERR_INVALID_ARG_VALUE, and because
+// this runs at module load the proxy dies before it ever listens — an operator
+// on Node 18 who set DNS_RESULT_ORDER=ipv6first lost the proxy entirely. The
+// preference is honoured where it is understood and announced where it is not.
+const dnsOrder = (() => {
+  const wanted = String(process.env.DNS_RESULT_ORDER || "ipv4first").trim().toLowerCase();
+  for (const order of [wanted, "ipv4first", "verbatim"]) {
+    try {
+      dns.setDefaultResultOrder(order);
+      if (order !== wanted) {
+        console.warn(
+          `[egress-proxy] DNS_RESULT_ORDER=${wanted} is not supported by this Node (${process.versions.node}); using ${order}`
+        );
+      }
+      return order;
+    } catch {}
+  }
+  return null;
+})();
 
 const PORT = parseInt(process.env.PORT || "8888", 10);
 const HOST = process.env.HOST || "127.0.0.1";

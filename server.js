@@ -1,6 +1,23 @@
 #!/usr/bin/env bun
 const dns = require("dns");
-dns.setDefaultResultOrder(process.env.DNS_RESULT_ORDER || "ipv4first");
+// `ipv6first` only exists from Node 22, and an unsupported order throws
+// ERR_INVALID_ARG_VALUE at module load — which kills the bridge before it
+// listens instead of merely changing a preference. Fall back in order.
+const DNS_RESULT_ORDER = (() => {
+  const wanted = String(process.env.DNS_RESULT_ORDER || "ipv4first").trim().toLowerCase();
+  for (const order of [wanted, "ipv4first", "verbatim"]) {
+    try {
+      dns.setDefaultResultOrder(order);
+      if (order !== wanted) {
+        console.warn(
+          `[opencode-free-bridge] DNS_RESULT_ORDER=${wanted} is not supported by this Node (${process.versions.node}); using ${order}`
+        );
+      }
+      return order;
+    } catch {}
+  }
+  return null;
+})();
 const http = require("http");
 const crypto = require("crypto");
 let VERSION = "1.5.0";

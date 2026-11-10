@@ -45,6 +45,24 @@ test("egress-proxy dials upstream IPv4-first by default", () => {
 });
 
 test("egress-proxy honours DNS_RESULT_ORDER like server.js does", () => {
-  assert.equal(resolveOrderInProxyProcess({ DNS_RESULT_ORDER: "ipv6first" }), "ipv6first");
+  // `ipv6first` exists from Node 22. On an older runtime the proxy must fall
+  // back to an order it understands instead of throwing at module load, which
+  // killed the process before it could listen (CI: compat 18.x went red).
+  let supportsIpv6First = true;
+  try {
+    require("dns").setDefaultResultOrder("ipv6first");
+  } catch {
+    supportsIpv6First = false;
+  }
+  const got = resolveOrderInProxyProcess({ DNS_RESULT_ORDER: "ipv6first" });
+  assert.equal(got, supportsIpv6First ? "ipv6first" : "ipv4first");
   assert.equal(resolveOrderInProxyProcess({ DNS_RESULT_ORDER: "verbatim" }), "verbatim");
+});
+
+test("egress-proxy starts even when DNS_RESULT_ORDER is unknown to the runtime", () => {
+  // The failure this guards: setDefaultResultOrder threw at module load, so the
+  // process never listened and an operator lost the proxy to a typo. Any
+  // nonsense value must land on a working order, not a dead process.
+  const got = resolveOrderInProxyProcess({ DNS_RESULT_ORDER: "not-a-real-order" });
+  assert.ok(got === "ipv4first" || got === "verbatim", `expected a working order, got ${got}`);
 });
