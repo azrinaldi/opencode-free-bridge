@@ -469,7 +469,7 @@ install_service() {
     if [ -w "$unit_dir" ]; then
       cat > "$unit" <<UNIT
 [Unit]
-Description=OpenCode Free Bridge (OpenAI-compatible, free-tier models)
+Description=OpenCode Free Bridge (OpenAI/Anthropic-compatible, free-tier models)
 After=network-online.target
 Wants=network-online.target
 
@@ -502,7 +502,7 @@ UNIT
       mkdir -p "$user_unit_dir"
       cat > "$user_unit" <<UNIT
 [Unit]
-Description=OpenCode Free Bridge (OpenAI-compatible, free-tier models)
+Description=OpenCode Free Bridge (OpenAI/Anthropic-compatible, free-tier models)
 After=network-online.target
 
 [Service]
@@ -683,7 +683,7 @@ cat <<NEXT
   API key  : public  (any value is accepted)
   Models   : curl http://$PROBE_HOST:$PORT/v1/models
 
-  Add it to 9Router, Cursor, Continue, or any OpenAI-compatible client as a
+  Add it to 9Router, Cursor, Continue, Claude Code, or any OpenAI/Anthropic-compatible client as a
   custom provider. Re-run the self-check any time with:
 
       "$RUNTIME" $BINDIR/verify.js

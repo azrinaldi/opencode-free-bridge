@@ -1,8 +1,8 @@
 # opencode-free-bridge
 
-OpenAI-compatible local API bridge for [OpenCode](https://opencode.ai) free-tier models. No account and no API key required.
+OpenAI/Anthropic-compatible local API bridge for [OpenCode](https://opencode.ai) free-tier models. No account and no API key required.
 
-It runs a local server on `http://127.0.0.1:20129/v1` that any OpenAI-compatible client (9Router, Cursor, Continue, LiteLLM, Open WebUI, or the OpenAI SDK) can call directly.
+It runs a local server on `http://127.0.0.1:20129/v1` that any OpenAI- or Anthropic-compatible client (9Router, Cursor, Continue, LiteLLM, Open WebUI, Claude Code, or the OpenAI/Anthropic SDK) can call directly.
 
 ## What's New in v2.0.0
 
@@ -18,6 +18,7 @@ It runs a local server on `http://127.0.0.1:20129/v1` that any OpenAI-compatible
 - **Self-healing client identity:** Derives the OpenCode CLI wire identity at the current release commit SHA and updates automatically when upstream tightens the gate.
 - **Live catalog discovery:** Reads `models.opencode.ai/api.json` (and `/v1/models`) to expose only active free-tier models (`cost.input === 0`, non-deprecated) and reject retired or paid model IDs locally with a clear error.
 - **Dual-protocol support:** Routes requests to `/inference/openai/v1/chat/completions` or `/inference/openai/v1/responses` based on catalog metadata and automatic protocol-mismatch detection.
+- **Anthropic Messages API:** `POST /v1/messages` (and `/messages`) accepts the Anthropic native request shape — `system` blocks, `tool_use` / `tool_result` content, `tool_choice`, `stop_sequences` — and streams Anthropic SSE events, so Claude Code and the Anthropic SDK can use the bridge directly.
 - **Reasoning-aware token budgeting:** Applies an additive token floor (`max(requested, 1024) + 4096`) for reasoning models (determined from catalog `reasoning: true` metadata) so short prompts do not return empty content with `finish_reason: "length"`.
 - **Reasoning stream normalization:** Emits thinking tokens under `reasoning_content` for both streaming SSE and non-streaming JSON responses, and forwards client tool calls with automatic name de-collision (`read` -> `read_client` upstream, restored to `read` on return).
 - **Zero dependencies:** Uses only built-in runtime modules (`http`, `crypto`, `fs`, `path`, `net`, `tls`). No `npm install` step.
@@ -218,6 +219,29 @@ print(response.choices[0].message.content)
 curl -s http://127.0.0.1:20129/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{"model":"mimo-v2.6-flash-free","messages":[{"role":"user","content":"Reply with OK"}]}'
+```
+
+### Anthropic Messages API
+
+The bridge also serves the Anthropic native `POST /v1/messages` (and `/messages`) protocol: `system` text/blocks, `tool_use` / `tool_result` content blocks, `tool_choice`, `stop_sequences`, and SSE streaming (`message_start`, `content_block_start`/`delta`/`stop`, `message_delta`, `message_stop`). Claude Code and the Anthropic SDK can point at the bridge directly.
+
+```bash
+curl -s http://127.0.0.1:20129/v1/messages \
+  -H 'Content-Type: application/json' \
+  -H 'x-api-key: public' \
+  -d '{"model":"mimo-v2.6-flash-free","max_tokens":1024,"messages":[{"role":"user","content":"Reply with OK"}]}'
+```
+
+```python
+from anthropic import Anthropic
+
+client = Anthropic(base_url="http://127.0.0.1:20129", api_key="public")
+message = client.messages.create(
+    model="mimo-v2.6-flash-free",
+    max_tokens=1024,
+    messages=[{"role": "user", "content": "Reply with OK"}],
+)
+print(message.content)
 ```
 
 ## Available Free Models
