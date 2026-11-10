@@ -226,10 +226,16 @@ test("server refuses to start on Node without ALLOW_NODE", () => {
   let code = 0;
   let stderr = "";
   try {
-    execFileSync(nodeBin, [server], { env, stdio: "pipe", timeout: 5000 });
+    // 5s was too tight: the refusal path loads every module before it can print,
+    // and on a cold, loaded CI runner that occasionally exceeded the budget. The
+    // resulting ETIMEDOUT left `err.status` undefined, so the assertion below
+    // read as "Node started successfully" — a flaky failure that named the wrong
+    // cause. The child prints and exits in well under a second locally.
+    execFileSync(nodeBin, [server], { env, stdio: "pipe", timeout: 30000 });
   } catch (err) {
     code = err.status;
     stderr = String(err.stderr || "");
+    assert.notEqual(err.signal, "SIGTERM", `node did not exit on its own within the timeout: ${stderr}`);
   }
   assert.equal(code, 1, "Node must exit non-zero");
   assert.match(stderr, /requires Bun/);
