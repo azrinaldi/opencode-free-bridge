@@ -1,6 +1,6 @@
 # opencode-free-bridge
 
-OpenAI-compatible local API bridge for [OpenCode](https://opencode.ai) free-tier models. No account and no API key required.
+OpenAI/Anthropic-compatible local API bridge for [OpenCode](https://opencode.ai) free-tier models. No account and no API key required.
 
 It runs a local server on `http://127.0.0.1:20129/v1` that any OpenAI-compatible client (9Router, Cursor, Continue, LiteLLM, Open WebUI, or the OpenAI SDK) can call directly.
 

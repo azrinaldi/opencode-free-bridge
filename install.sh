@@ -469,7 +469,7 @@ install_service() {
     if [ -w "$unit_dir" ]; then
       cat > "$unit" <<UNIT
 [Unit]
-Description=OpenCode Free Bridge (OpenAI-compatible, free-tier models)
+Description=OpenCode Free Bridge (OpenAI/Anthropic-compatible, free-tier models)
 After=network-online.target
 Wants=network-online.target
 
@@ -502,7 +502,7 @@ UNIT
       mkdir -p "$user_unit_dir"
       cat > "$user_unit" <<UNIT
 [Unit]
-Description=OpenCode Free Bridge (OpenAI-compatible, free-tier models)
+Description=OpenCode Free Bridge (OpenAI/Anthropic-compatible, free-tier models)
 After=network-online.target
 
 [Service]
