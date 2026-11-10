@@ -211,12 +211,16 @@ async function drillVersionFloor({ identity, __syncUserAgent }) {
 
   lineMaybe(judge(res.status === 200, busy), "client received 200, not the gate error");
   lineMaybe(judge(content(res).length > 0, busy), "client received real content");
-  line(healed, "version floor was learned from the rejection");
-  line(uaAfter !== uaBefore, "User-Agent moved off the rejected version");
-  line(moved, "identity now follows the current release");
+  // The heal half can only be judged when upstream issued a gate verdict: a 429
+  // never triggers the reactive refresh, so a stale UA/floor is the expected
+  // outcome, not a bridge fault (2026-11-07 CI: a 429 burst FAILed this drill).
+  lineMaybe(judge(healed, busy), "version floor was learned from the rejection");
+  lineMaybe(judge(uaAfter !== uaBefore, busy), "User-Agent moved off the rejected version");
+  lineMaybe(judge(moved, busy), "identity now follows the current release");
 
   // A 429 means upstream never judged the healed shape, so the client-facing
   // half of this drill is undecided even when every heal assertion passed.
+  if (busy) return null;
   if (!healed || !moved) return false;
   return judge(answered, busy);
 }
@@ -1026,7 +1030,13 @@ async function main() {
 
 let port = () => 0;
 
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+// Exported for test/drill-semantics.test.js: the tri-state verdict contract
+// (true / null / false) is what keeps an undecided live drill from failing CI.
+module.exports = { DRILLS, judge };
+
+if (require.main === module) {
+  main().catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });
+}
