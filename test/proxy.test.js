@@ -615,12 +615,16 @@ describe("egress pool: health survives a restart", () => {
     proxy.resetHealth();
   });
 
-  it("remembers a cooling entry across a reload and keeps the same desired state", () => {
+  it("remembers a cooling entry across a reload when the record names its address", () => {
     proxy.setPool({ entries: ["http://a:1", "http://b:2"] });
+    // A cooldown that names the address that earned it stays parked: that exit
+    // IP is still the one upstream refused.
+    proxy.noteExitIp("http://a:1", "203.0.113.9");
     proxy.markFailure("http://a:1", { reason: "allowance 429", cooldownMs: 60000 });
 
     // A fresh process reads the pool and the health file; only the pool config
     // is operator intent, so losing health here would re-burn a spent IP.
+    proxy.__flushHealth();
     proxy.__restart();
 
     const state = proxy.describe();
@@ -630,6 +634,23 @@ describe("egress pool: health survives a restart", () => {
     assert.ok(a.cooldownMsLeft > 50000, `expected cooldown to survive, got ${a.cooldownMsLeft}`);
     assert.equal(state.pool.ready, 1);
     assert.equal(proxy.pick().url, "http://b:2");
+  });
+
+  it("drops a long cooldown whose record cannot name the address that earned it", () => {
+    // The allowance is keyed to the exit address, and a phone on mobile data
+    // rotates it several times a day. A 13-hour Retry-After restored from an
+    // older health file with no `exitIp` is unverifiable — trusting it kept a
+    // healthy phone parked all day while the same URL answered 200.
+    proxy.setPool({ entries: ["http://a:1"] });
+    proxy.markFailure("http://a:1", { reason: "allowance 429", cooldownMs: 47_000_000 });
+    proxy.__flushHealth();
+    const raw = JSON.parse(fs.readFileSync(proxy.healthFile(), "utf8"));
+    for (const e of raw.entries) delete e.exitIp;
+    fs.writeFileSync(proxy.healthFile(), JSON.stringify(raw));
+    proxy.__restart();
+    const entry = proxy.describe().pool.entries[0];
+    assert.equal(entry.state, "ready", "an unverifiable park must not survive a restart");
+    assert.equal(entry.cooldownMsLeft, 0);
   });
 
   it("restores the failure count so backoff continues instead of restarting", () => {

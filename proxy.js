@@ -387,15 +387,25 @@ function restoreHealth(entries, now = Date.now()) {
     if (!record) continue;
     const cooldownUntil = Number(record.cooldownUntil);
     const failures = Number(record.failures);
+    const hasExitIp = typeof record.exitIp === "string" && record.exitIp;
+    // A cooldown is only trusted when the record says which address earned it.
+    // An older health file has no `exitIp`, and the free allowance is keyed to
+    // the address upstream sees — a phone on mobile data rotates it several
+    // times a day. A 13-hour `Retry-After` restored from a record that cannot
+    // name its address is an unverifiable claim, and trusting it kept a healthy
+    // phone parked all day. Clear it and let the next request re-learn: at worst
+    // one request per unverified entry, and a still-spent IP simply parks again
+    // with its own fresh `Retry-After`.
+    const rawUntil = Number.isFinite(cooldownUntil) && cooldownUntil > now ? cooldownUntil : 0;
     health.set(key, {
       failures: Number.isFinite(failures) && failures > 0 ? Math.floor(failures) : 0,
-      cooldownUntil: Number.isFinite(cooldownUntil) && cooldownUntil > now ? cooldownUntil : 0,
+      cooldownUntil: hasExitIp ? rawUntil : 0,
       lastError: typeof record.lastError === "string" ? record.lastError : null,
       lastOkAt: Number.isFinite(Number(record.lastOkAt)) ? Number(record.lastOkAt) : 0,
       lastUsedAt: Number.isFinite(Number(record.lastUsedAt)) ? Number(record.lastUsedAt) : 0,
       lastStatus: typeof record.lastStatus === "string" ? record.lastStatus : null,
     });
-    if (typeof record.exitIp === "string" && record.exitIp) exitIpByKey.set(key, record.exitIp);
+    if (hasExitIp) exitIpByKey.set(key, record.exitIp);
     restored += 1;
   }
   return restored;
@@ -636,6 +646,24 @@ function markSuccess(egressUrl, { now = Date.now() } = {}) {
   // Every request lands here, so this one is coalesced.
   scheduleHealthWrite();
   return h;
+}
+
+/**
+ * Remember the address an egress is currently exiting through.
+ *
+ * Called with the exit IP a probe already read, so a cooldown can record which
+ * address earned it. Optional by design: a probe that fails (proxy down, trace
+ * unreachable) leaves the mapping alone rather than inventing one, and the
+ * capped-cooldown path in `loadFromDisk` covers records written without it.
+ */
+function noteExitIp(egressUrl, ip, { now = Date.now() } = {}) {
+  if (egressUrl === null || egressUrl === undefined) return null;
+  if (typeof ip !== "string" || !ip) return null;
+  const key = keyOf(egressUrl);
+  if (exitIpByKey.get(key) === ip) return ip;
+  exitIpByKey.set(key, ip);
+  scheduleHealthWrite(now);
+  return ip;
 }
 
 function resetHealth() {
@@ -1062,9 +1090,15 @@ async function testPool({ probeUrl = null, timeoutMs = 15000 } = {}) {
     entries.map(async (entry) => {
       if (!entry.enabled) return { id: entry.id, label: entry.label, host: displayHost(entry.url), skipped: true };
       const verdict = await testProxy(entry.url, { probeUrl, timeoutMs });
-      if (verdict.ok) markSuccess(entry.url);
+      const ok = verdict.ok;
+      if (ok) markSuccess(entry.url);
       else if (verdict.apiStatus === 403) markFailure(entry.url, { reason: "upstream 403" });
-      const h = health.get(entry.url);
+      // Record where this entry exits, so a later cooldown can name the address
+      // that earned it and a rotation can be told apart from a still-spent IP.
+      if (verdict.exitIp) noteExitIp(entry.url, verdict.exitIp);
+      // `health` is keyed by keyOf(), which maps the direct entry's empty URL to
+      // "@direct" — reading it by the raw url would silently report no state.
+      const h = health.get(keyOf(entry.url));
       return {
         id: entry.id,
         label: entry.label,
@@ -1213,6 +1247,7 @@ module.exports = {
   markFailure,
   markSuccess,
   resetHealth,
+  noteExitIp,
   withProxy,
   netFetch,
   testProxy,
