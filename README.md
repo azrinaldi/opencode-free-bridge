@@ -176,6 +176,24 @@ docker run -d --name opencode-free-bridge \
 2. Models are imported as `zen/big-pickle`, `zen/mimo-v2.6-flash-free`, `zen/nemotron-3-ultra-free`, etc.
 3. Optional: if you run the bridge on multiple hosts (for example, a laptop and a VPS), register each host as a separate connection in 9Router so per-IP rate limits fail over automatically.
 
+**9Router's SSRF guard blocks `127.0.0.1` by default.** The guard exists so a
+request cannot reach an internal address, and the bridge's own base URL looks
+exactly like one. Two ways through, depending on how 9Router was started:
+
+| 9Router started… | What to do |
+|---|---|
+| With `ALLOW_PRIVATE_NETWORKING=true` | Nothing. The guard short-circuits for the whole process, so loopback works as documented above. |
+| Without it | Add `ALLOW_PRIVATE_NETWORKING=true` to its service environment and restart. |
+
+Symptom without it: the connection's test button fails and chat answers an
+error, both reporting `request to private/reserved IP blocked by SSRF
+protection`. The bridge itself is fine — `curl http://127.0.0.1:20129/health`
+still answers `ok` from that host, so those two symptoms together mean the
+guard, not the bridge.
+
+This only applies to 9Router running on the same machine. Every other client
+(LiteLLM, the OpenAI SDK, Cursor) talks to loopback directly and is unaffected.
+
 ### LiteLLM, Open WebUI, Continue, Cursor
 
 Use the same three settings: Base URL `http://127.0.0.1:20129/v1`, API key `public`, and model IDs from `/v1/models`.
