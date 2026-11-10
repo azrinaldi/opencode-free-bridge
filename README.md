@@ -208,6 +208,48 @@ model_list:
       api_key: public
 ```
 
+### Anthropic Messages API
+
+The bridge also serves Anthropic's native `POST /v1/messages`, so Claude Code and
+the Anthropic SDK can point at it directly. Model ids are the same bare ids the
+OpenAI endpoint uses.
+
+| Setting | Value |
+|---|---|
+| Base URL | `http://127.0.0.1:20129` |
+| API key | `public` (sent as `x-api-key`, any non-empty string works) |
+| Path | `/v1/messages` |
+
+```bash
+curl -s http://127.0.0.1:20129/v1/messages \
+  -H 'Content-Type: application/json' \
+  -H 'x-api-key: public' \
+  -d '{"model":"big-pickle","max_tokens":1024,
+       "messages":[{"role":"user","content":"Reply with OK"}]}'
+```
+
+```python
+from anthropic import Anthropic
+
+client = Anthropic(base_url="http://127.0.0.1:20129", api_key="public")
+message = client.messages.create(
+    model="big-pickle",
+    max_tokens=1024,
+    messages=[{"role": "user", "content": "Reply with OK"}],
+)
+print(message.content[0].text)
+```
+
+Streaming is real, not replayed: `stream: true` relays each upstream delta as it
+arrives, including `input_json_delta` for tool calls. `POST
+/v1/messages/count_tokens` also answers — with a conservative 4-chars-per-token
+estimate, because this bridge has no Anthropic tokenizer and a made-up exact
+number would be worse than an honest approximation.
+
+Anthropic-only parameters with no OpenAI equivalent — `thinking`, `top_k`,
+`metadata`, `container` — are ignored, and the bridge logs one line naming them
+so a caller that expected a thinking budget can see why it got none.
+
 ### Coding agents & CLI tools
 
 ```bash

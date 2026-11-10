@@ -1,4 +1,30 @@
 # Changelog
+## [2.4.0] — 2026-11-10
+
+Anthropic's Messages API, with streaming that is actually streamed.
+
+Claude Code and anything built on the Anthropic SDK speak `/v1/messages`, which
+this bridge did not serve. The adapter relays through this bridge's own
+`/v1/chat/completions`, so the Anthropic path inherits the gate anchors, session
+minting, egress pool and self-healing retries instead of reimplementing them.
+
+- `POST /v1/messages` accepts `system` blocks, `tool_use` / `tool_result`
+  content, `tool_choice` and `stop_sequences`, and answers either Anthropic JSON
+  or SSE.
+- Streaming is forwarded as it arrives. The first version of this adapter
+  buffered the whole completion and replayed it as SSE: measured, nine events
+  landed in 17ms with a single `content_block_delta`, so a long generation
+  looked frozen. The relay now emits each upstream delta immediately, including
+  `input_json_delta` for tool calls, and asks upstream for
+  `stream_options.include_usage` so a streamed reply still reports tokens.
+- `POST /v1/messages/count_tokens` answers with a conservative
+  four-characters-per-token estimate. There is no Anthropic tokenizer here, and
+  an invented exact number would be worse than a stated approximation.
+- Anthropic-only parameters with no OpenAI equivalent (`thinking`, `top_k`,
+  `metadata`, `container`) are ignored with one log line naming them.
+- `anthropic.js` joined `UPDATE_FILES`: a release whose `server.js` requires it
+  would otherwise crash-loop on installs that never fetched it.
+
 ## [2.3.2] — 2026-11-10
 
 A rotated address clears the cooldown its predecessor earned, and an

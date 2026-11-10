@@ -25,6 +25,7 @@ try {
   VERSION = require("./package.json").version || VERSION;
 } catch {}
 const { effectiveMaxTokens } = require("./token-budget");
+const { handleAnthropicMessages, handleCountTokens } = require("./anthropic");
 
 /**
  * Load a sibling module, or a fallback when the file is not on disk yet.
@@ -223,6 +224,7 @@ const UPDATE_FILES = [
   "proxy.js",
   "panel.js",
   "egress-proxy.js",
+  "anthropic.js",
   "server.js",
   "THIRD_PARTY_NOTICES.md",
 ];
@@ -2147,6 +2149,34 @@ function handleRequest(req, res) {
     return res.end(cachedModelsPayload);
   }
 
+  // Anthropic Messages API. Relays through this bridge's own chat route, so the
+  // Anthropic path inherits the gate anchors, session minting, egress pool and
+  // self-healing retries instead of duplicating them.
+  if (req.method === "POST" && (pathname === "/v1/messages" || pathname === "/messages")) {
+    handleAnthropicMessages(req, res).catch((err) => {
+      if (res.headersSent) {
+        res.destroy();
+        return;
+      }
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ type: "error", error: { type: "api_error", message: err.message } }));
+    });
+    return;
+  }
+  if (
+    req.method === "POST" &&
+    (pathname === "/v1/messages/count_tokens" || pathname === "/messages/count_tokens")
+  ) {
+    handleCountTokens(req, res).catch((err) => {
+      if (res.headersSent) {
+        res.destroy();
+        return;
+      }
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ type: "error", error: { type: "api_error", message: err.message } }));
+    });
+    return;
+  }
   // Chat completions
   if (req.method === "POST" && (pathname === "/v1/chat/completions" || pathname === "/chat/completions")) {
     (async () => {
