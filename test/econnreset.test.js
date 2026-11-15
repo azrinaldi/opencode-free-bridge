@@ -66,6 +66,25 @@ describe("ECONNRESET during a WARP hop", () => {
     });
   }
 
+  // The idle test runs FIRST: the busy test resets rotator state at its end,
+  // and bun's scheduler may interleave sibling tests, so anything the busy
+  // test holds (inFlight) must not be disturbed by a later sibling. Idle has
+  // no cross-test expectations beyond "busy is false", which its own reset
+  // guarantees.
+  it("keeps the generic 500 when ECONNRESET happens with no rotation busy", async () => {
+    rotator.__reset({ keepConfig: true });
+    assert.equal(rotator.describe().busy, false);
+    mockFetchImpl = async () => {
+      const err = new TypeError("The socket connection was closed unexpectedly.");
+      err.code = "ECONNRESET";
+      throw err;
+    };
+    const res = await post();
+    assert.equal(res.status, 500);
+    assert.equal(res.body.error.type, "server_error");
+    assert.match(res.body.error.message, /closed unexpectedly/);
+  });
+
   it("answers 503 + Retry-After when the socket dies while a rotation is busy", { timeout: 15000 }, async () => {
     mockFetchImpl = async () => {
       const err = new TypeError("The socket connection was closed unexpectedly.");
@@ -76,6 +95,7 @@ describe("ECONNRESET during a WARP hop", () => {
     // resolves until we release it. Real command execution is CI-flaky (a
     // skip for any reason makes busy false and the test asserts the wrong
     // branch), so the hold rides the probe seam instead.
+    rotator.__reset({ keepConfig: true });
     let releaseProbe;
     const gate = new Promise((resolve) => (releaseProbe = resolve));
     rotator.__setProbeImpl(async () => {
@@ -91,8 +111,21 @@ describe("ECONNRESET during a WARP hop", () => {
     );
     const hold = rotator.rotate({ egressUrl: null, trigger: "manual" });
     // rotate() runs synchronously up to its first await, so inFlight is set
-    // (busy) the moment the call returns — no timing window to race.
-    assert.equal(rotator.describe().busy, true, "hold rotation must occupy the single-flight");
+    // (busy) the moment the call returns. Poll anyway, and if it never comes
+    // up, fail with the awaited hold entry so the skip reason is visible in
+    // CI annotations instead of a bare false !== true.
+    let busySeen = rotator.describe().busy;
+    if (!busySeen) {
+      for (let i = 0; i < 20 && !busySeen; i++) {
+        await new Promise((r) => setTimeout(r, 50));
+        busySeen = rotator.describe().busy;
+      }
+    }
+    if (!busySeen) {
+      const entry = await Promise.race([hold, new Promise((r) => setTimeout(() => r({ timeout: true }), 500))]);
+      rotator.__setProbeImpl(null);
+      assert.fail("hold rotation never became busy; entry: " + JSON.stringify(entry));
+    }
 
     const res = await post();
     assert.equal(res.status, 503);
@@ -104,19 +137,5 @@ describe("ECONNRESET during a WARP hop", () => {
     await hold;
     rotator.__setProbeImpl(null);
     rotator.__reset({ keepConfig: true });
-  });
-
-  it("keeps the generic 500 when ECONNRESET happens with no rotation busy", async () => {
-    rotator.__reset({ keepConfig: true });
-    assert.equal(rotator.describe().busy, false);
-    mockFetchImpl = async () => {
-      const err = new TypeError("The socket connection was closed unexpectedly.");
-      err.code = "ECONNRESET";
-      throw err;
-    };
-    const res = await post();
-    assert.equal(res.status, 500);
-    assert.equal(res.body.error.type, "server_error");
-    assert.match(res.body.error.message, /closed unexpectedly/);
   });
 });
