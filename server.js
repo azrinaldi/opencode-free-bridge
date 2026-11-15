@@ -620,7 +620,9 @@ async function maybeRotateOn429(req, res, egressState) {
   }
   if (state.coolingForMs > 0 || state.busy) {
     console.warn(
-      `[opencode-free-bridge] Rotator skipped on 429: ${state.coolingForMs > 0 ? "cooling" : "busy"}`
+      `[opencode-free-bridge] Rotator skipped on 429: ${
+        state.coolingForMs > 0 ? `cooling ${Math.ceil(state.coolingForMs / 1000)}s (hop cooldown; the previous hop is still fresh)` : "busy"
+      }`
     );
     return false;
   }
