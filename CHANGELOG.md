@@ -1,4 +1,23 @@
 # Changelog
+## [Unreleased]
+
+### Fixed
+
+- A request that dials while the WARP tunnel is down mid-hop gets
+  `ConnectionRefused`, not the `ECONNRESET` of a socket killed mid-flight. Both
+  now share the busy-rotator branch: `503` with `Retry-After: 10` and one warn
+  line, instead of a generic `500` exception with a stack trace.
+
+### Changed
+
+- The reactive rotator parks itself after `ROTATION_INEFFECTIVE_LIMIT` (default
+  `3`) consecutive quota-429 rotations whose fresh egress address is refused
+  again — the measured shared-WARP-pool case, where every `/64` the pool hands
+  out is already quota-spent and a hop costs ~9s of tunnel churn for nothing.
+  While parked, quota 429s are answered directly with the upstream
+  `Retry-After`; `/health` exposes `egress.rotator.rotationIneffective`, and a
+  manual rotation resets the counter.
+
 ## [2.4.0] — 2026-11-10
 
 Anthropic's Messages API, with streaming that is actually streamed.

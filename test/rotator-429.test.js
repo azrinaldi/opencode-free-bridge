@@ -397,4 +397,59 @@ describe("429 → egress rotation → retry (server flow)", () => {
       rotator.__setProbeImpl(null);
     }
   });
+
+  it("parks the reactive rotator after 3 consecutive rotations that still 429 (circuit breaker)", { timeout: 30000 }, async () => {
+    // Every rotation succeeds at changing the IP, but upstream refuses the
+    // fresh address too — the measured "WARP pool collectively spent" case.
+    // After ROTATION_INEFFECTIVE_LIMIT (3) fruitless hops the bridge must stop
+    // paying the hop and answer the quota 429 directly. The hop command must
+    // SUCCEED so the rotation is ok and the retry runs: a failing command
+    // aborts before the retry path and the breaker never counts it.
+    fs.writeFileSync(
+      path.join(stateDir, "rotator.json"),
+      JSON.stringify({
+        command: process.platform === "win32" ? "cmd /c exit 0" : "true",
+        timeoutMs: 3000,
+        cooldownMs: 1000,
+      })
+    );
+    const post = () =>
+      httpRequest(port, "POST", "/v1/chat/completions", {
+        model: "big-pickle",
+        stream: true,
+        messages: [{ role: "user", content: "hi" }],
+      });
+
+    // Upstream refuses EVERY address tonight: initial attempt and every
+    // post-rotation retry get the quota 429. The cooldown floor is 5s
+    // (readEffective clamps file/env values to >= 5000), so consecutive
+    // reactive rotations must be spaced out; real trips accumulate across
+    // minutes, the test compresses them with 5.1s gaps.
+    mockFetchImpl = async () => UP429();
+    process.env.WARP_ROTATE_COOLDOWN_MS = "5000";
+    rotator.__setProbeImpl(async () => ({ ip: `203.0.113.${Date.now() % 250}`, error: null }));
+    const cooldownWait = () => new Promise((r) => setTimeout(r, 5100));
+    try {
+      for (let i = 0; i < 3; i += 1) {
+        if (i > 0) await cooldownWait();
+        const res = await post();
+        assert.equal(res.status, 429, `attempt ${i + 1}: fresh IP also refused`);
+        assert.equal(rotator.describe().rotations, i + 1, `attempt ${i + 1}: exactly one rotation ran`);
+      }
+      // Breaker is now tripped: the next 429 must not rotate at all.
+      const res = await post();
+      assert.equal(res.status, 429);
+      assert.equal(rotator.describe().rotations, 3, "no fourth hop after the breaker trips");
+      const health = await httpRequest(port, "GET", "/health");
+      assert.equal(health.body.egress.rotator.rotationIneffective, 3);
+      assert.equal(health.body.egress.rotator.rotationIneffectiveLimit, 3);
+    } finally {
+      rotator.__setProbeImpl(null);
+      delete process.env.WARP_ROTATE_COOLDOWN_MS;
+      // Clear the module-level breaker so other tests start clean: a manual
+      // rotate resets the counter (operator intent), cooldown may 409 it.
+      const manual = await httpRequest(port, "POST", "/api/rotator", { rotate: true }).catch(() => null);
+      assert.ok(manual === null || manual.status === 200 || manual.status === 409);
+    }
+  });
 });

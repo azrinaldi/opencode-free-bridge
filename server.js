@@ -218,6 +218,20 @@ const GATE_RETRY_COOLDOWN_MS = parseInt(
   process.env.GATE_RETRY_COOLDOWN_MS || "30000",
   10
 );
+// Circuit breaker for the reactive rotator. A rotation that buys a working
+// allowance resets this; a rotation whose fresh address is refused again (the
+// WARP /64 pool being collectively spent is the measured case) increments it.
+// After ROTATION_INEFFECTIVE_LIMIT consecutive fruitless rotations the bridge
+// stops paying the ~9s hop and the ~10s tunnel gap for a 429 it can predict,
+// and answers the quota 429 directly until one of: a rotation succeeds again
+// (never happens while tripped — the hook is skipped), the client sets an
+// egress proxy, or the process restarts. The operator can always rotate
+// manually from the panel; that path is not throttled by this breaker.
+const ROTATION_INEFFECTIVE_LIMIT = parseInt(
+  process.env.ROTATION_INEFFECTIVE_LIMIT || "3",
+  10
+);
+let rotationIneffectiveRuns = 0;
 const CORS_ORIGIN = process.env.CORS_ORIGIN !== undefined ? process.env.CORS_ORIGIN : "";
 // Optional egress relay. When set, every upstream inference request is sent to
 // this relay URL instead of directly to opencode.ai, with the real origin and
@@ -598,6 +612,12 @@ function retryAfterMs(res) {
 async function maybeRotateOn429(req, res, egressState) {
   const state = rotator.describe();
   if (!state.enabled) return false;
+  if (rotationIneffectiveRuns >= ROTATION_INEFFECTIVE_LIMIT) {
+    console.warn(
+      `[opencode-free-bridge] Rotator skipped on 429: ${rotationIneffectiveRuns} consecutive rotations bought no working allowance; waiting for the allowance window instead of hopping again`
+    );
+    return false;
+  }
   if (state.coolingForMs > 0 || state.busy) {
     console.warn(
       `[opencode-free-bridge] Rotator skipped on 429: ${state.coolingForMs > 0 ? "cooling" : "busy"}`
@@ -2066,6 +2086,9 @@ async function handleRotatorApi(req, res, pathname) {
   // configured single proxy when one exists (same rule as the reactive path:
   // the IP that matters is the one requests leave through).
   if (payload.rotate === true) {
+    // An operator asking for a rotation by hand is an explicit "try again":
+    // clear the ineffective-rotation breaker so the reactive path follows.
+    rotationIneffectiveRuns = 0;
     const result = await rotator
       .rotate({ egressUrl: proxy.getProxyUrl() || null, trigger: "manual" })
       .catch((err) => ({
@@ -2320,7 +2343,14 @@ function handleRequest(req, res) {
           proxy: proxyState,
           // Reactive egress rotator (WARP-style hop on 429). Presence here with
           // `enabled: false` means the module is loaded but no command is set.
-          rotator: rotator.describe(),
+          // rotationIneffective counts consecutive rotations whose fresh
+          // address was refused again; at the limit the reactive hook parks
+          // itself until a manual rotation or process restart.
+          rotator: {
+            ...rotator.describe(),
+            rotationIneffective: rotationIneffectiveRuns,
+            rotationIneffectiveLimit: ROTATION_INEFFECTIVE_LIMIT,
+          },
           // Per-egress wire traffic and token accounting (usage.json). The
           // phone entry here is the mobile-data cost of the bridge today.
           ...(usageView ? { usage: usageView } : {}),
@@ -2847,6 +2877,7 @@ function handleRequest(req, res) {
             consumedErrorText = null;
             if (upstreamRes.ok) {
               proxy.markSuccess(egressState.egressUrl);
+              rotationIneffectiveRuns = 0;
               console.warn("[opencode-free-bridge] 429 cleared by egress rotation; upstream accepted the retry");
             } else if (upstreamRes.status === 429) {
               // Still spent on the fresh address too. The Retry-After must
@@ -2856,6 +2887,7 @@ function handleRequest(req, res) {
                 reason: "allowance 429 after rotation",
                 cooldownMs: retryAfterMs(upstreamRes) ?? null,
               });
+              rotationIneffectiveRuns += 1;
             }
           }
         }

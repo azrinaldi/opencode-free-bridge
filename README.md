@@ -517,6 +517,7 @@ Before running the 4 live drills, `gate-drill.js` sends a single CLI-shaped cont
 | `UPSTREAM_PROXY_URL` | _(unset)_ | Operator-level default for the egress proxy (`http://[user:pass@]host:port`). When set it wins over the panel and locks runtime edits. See [Egress proxy](#egress-proxy) |
 | `PANEL_ALLOWED_HOSTS` | _(unset)_ | Extra `Host` names the panel and `/api/proxy` accept (comma-separated), for a reverse proxy in front of the bridge. Loopback names and the configured `HOST` are always accepted |
 | `WARP_ROTATE_CMD` | _(unset)_ | Command run once on a quota 429 (`FreeUsageLimitError`; capacity 429s pass through) to change the egress IP (WARP reconnect / hop CLI). When set it wins over the panel and locks runtime edits. See [Reactive egress rotation](#reactive-egress-rotation-warp-hop-on-429) |
+| `ROTATION_INEFFECTIVE_LIMIT` | `3` | Consecutive quota-429 rotations whose fresh address is refused again before the reactive rotator parks itself (answers 429 without hopping). A manual rotation resets the counter. |
 | `LOG_BUFFER_LINES` | `500` | Size of the in-memory log ring buffer served to the panel's Log bridge tab (`/api/logs`). Oldest lines fall off; the full history remains with the service manager (journald, docker logs, or the foreground terminal). |
 | `WARP_ROTATE_TIMEOUT_MS` | `45000` | Whole-rotation deadline: command run + exit-IP polling. The original 429 passes through when the IP has not changed by then |
 | `WARP_ROTATE_COOLDOWN_MS` | `75000` | Minimum gap between two rotations (manual or reactive), protecting the tunnel from hop storms |
@@ -759,10 +760,20 @@ below are observed facts, not guesses:
   parse; anything else is rejected with a parse error rather than guessed.
 - **The hop drops in-flight requests through the tunnel.** Disconnecting the
   tunnel resets every socket mid-flight, so concurrent client requests die with
-  `ECONNRESET` while the hop runs (~10s). The bridge classifies that as expected
-  rotator behavior: one warn line in the log, and the client gets `503` with
-  `Retry-After: 10` instead of a generic `500`. Only an `ECONNRESET` while the
-  rotator is *idle* is a real transport fault.
+  `ECONNRESET`, and fresh dials while the tunnel is down fail with
+  `ConnectionRefused`. The bridge classifies both as expected rotator behavior:
+  one warn line in the log, and the client gets `503` with `Retry-After: 10`
+  instead of a generic `500`. The same errors while the rotator is *idle* are
+  real transport faults.
+- **The rotator parks itself when hops stop working.** If the WARP pool hands
+  out only addresses upstream refuses (the measured case: a `/64` pool shared
+  with many WARP users is collectively quota-spent), every hop costs ~9s of
+  tunnel churn plus the ~10s dead window and buys nothing. After
+  `ROTATION_INEFFECTIVE_LIMIT` (default 3, env-tunable) consecutive rotations
+  whose fresh address is refused again, the reactive hook parks: quota 429s are
+  answered directly (with the upstream `Retry-After`) instead of hopping.
+  `/health` reports the counter as `egress.rotator.rotationIneffective`; a
+  manual rotation (panel or `POST /api/rotator {"rotate":true}`) resets it.
 
 #### In Docker
 
