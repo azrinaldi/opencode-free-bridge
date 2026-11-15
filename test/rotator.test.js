@@ -100,6 +100,23 @@ describe("rotator", () => {
       });
       assert.equal(second.ok, false);
       assert.equal(second.skipped, "cooling");
+
+      // The caller can vouch that the wait protects nothing (reactive hook
+      // after the fresh address was refused, or an operator's manual click):
+      // the cooldown is waived, but busy and the hourly cap still apply.
+      let afterThirdRun = false;
+      const third = await rotator.rotate({
+        _probe: async () => ({ ip: afterThirdRun ? "c" : "b", error: null }),
+        _run: async () => {
+          afterThirdRun = true;
+          return { ok: true, error: null, output: "", stderr: "" };
+        },
+        ignoreCooldown: true,
+      });
+      assert.equal(third.skipped, null, "cooldown is waived for a justified hop");
+      assert.equal(third.ok, true);
+      assert.equal(third.fromIp, "b");
+      assert.equal(third.toIp, "c");
     });
   });
 

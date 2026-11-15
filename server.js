@@ -618,12 +618,22 @@ async function maybeRotateOn429(req, res, egressState) {
     );
     return false;
   }
-  if (state.coolingForMs > 0 || state.busy) {
+  // Cooldown paces hops whose outcome is still unknown: a hop that just moved
+  // the exit IP deserves a chance to be the one that works. Once its fresh
+  // address has been refused (the counter below is exactly that evidence),
+  // waiting out the rest of the cooldown protects nothing — the operator's
+  // call was "if the newest IP still 429s, hop again right away". Single-flight
+  // (busy) still serializes hops and the breaker above still caps the futility.
+  if (state.coolingForMs > 0 && rotationIneffectiveRuns === 0) {
     console.warn(
-      `[opencode-free-bridge] Rotator skipped on 429: ${
-        state.coolingForMs > 0 ? `cooling ${Math.ceil(state.coolingForMs / 1000)}s (hop cooldown; the previous hop is still fresh)` : "busy"
-      }`
+      `[opencode-free-bridge] Rotator skipped on 429: cooling ${Math.ceil(
+        state.coolingForMs / 1000
+      )}s (hop cooldown; the previous hop is still fresh)`
     );
+    return false;
+  }
+  if (state.busy) {
+    console.warn("[opencode-free-bridge] Rotator skipped on 429: busy");
     return false;
   }
   // Client still there? `req.destroyed` is useless here: Bun marks an
@@ -642,7 +652,14 @@ async function maybeRotateOn429(req, res, egressState) {
     }; rotating egress before retry`
   );
   const result = await rotator
-    .rotate({ egressUrl: egressState.egressUrl ?? null, trigger: "429" })
+    .rotate({
+      egressUrl: egressState.egressUrl ?? null,
+      trigger: "429",
+      // The fresh address was already refused (counter > 0): cooldown paces a
+      // hop whose outcome is unknown, and this one's outcome is known-spent.
+      // The breaker above still caps how many of these justified hops run.
+      ignoreCooldown: rotationIneffectiveRuns > 0,
+    })
     .catch((err) => ({
       ok: false,
       changed: false,
@@ -2089,10 +2106,16 @@ async function handleRotatorApi(req, res, pathname) {
   // the IP that matters is the one requests leave through).
   if (payload.rotate === true) {
     // An operator asking for a rotation by hand is an explicit "try again":
-    // clear the ineffective-rotation breaker so the reactive path follows.
+    // clear the ineffective-rotation breaker so the reactive path follows, and
+    // honor the click immediately (cooldown is pacing for the reactive path;
+    // a deliberate click is not something to pace).
     rotationIneffectiveRuns = 0;
     const result = await rotator
-      .rotate({ egressUrl: proxy.getProxyUrl() || null, trigger: "manual" })
+      .rotate({
+        egressUrl: proxy.getProxyUrl() || null,
+        trigger: "manual",
+        ignoreCooldown: true,
+      })
       .catch((err) => ({
         ok: false,
         changed: false,

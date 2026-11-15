@@ -774,6 +774,14 @@ below are observed facts, not guesses:
   answered directly (with the upstream `Retry-After`) instead of hopping.
   `/health` reports the counter as `egress.rotator.rotationIneffective`; a
   manual rotation (panel or `POST /api/rotator {"rotate":true}`) resets it.
+- **Cooldown pacing ends where evidence begins.** The inter-hop cooldown
+  (`cooldownMs`) paces a hop whose outcome is still unknown. Once the previous
+  hop's fresh address has been refused, the reactive hook hops again
+  immediately instead of waiting the cooldown out — the address the wait was
+  protecting is already proven spent. Single-flight (one hop at a time) and the
+  hourly cap still apply; the breaker above is the futility cap. A manual
+  rotation always skips the cooldown wait: a deliberate click is not something
+  to pace.
 
 #### In Docker
 

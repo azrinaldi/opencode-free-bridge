@@ -236,7 +236,7 @@ let probeIntervalMs = PROBE_INTERVAL_MS;
 const HISTORY_LIMIT = 50;
 let history = []; // newest last; { at, ok, changed, fromIp, toIp, skipped, error, durationMs, trigger }
 
-async function rotate({ now = Date.now(), _probe = null, _run = runCommand, egressUrl = null, trigger = "manual" } = {}) {
+async function rotate({ now = Date.now(), _probe = null, _run = runCommand, egressUrl = null, trigger = "manual", ignoreCooldown = false } = {}) {
   const cfg = readEffective();
   const probe = _probe || probeExitIpImpl || probeExitIp;
   const started = now;
@@ -260,7 +260,12 @@ async function rotate({ now = Date.now(), _probe = null, _run = runCommand, egre
 
   if (!cfg.command) return skip("disabled", "Perintah rotasi belum diatur.");
   if (inFlight) return skip("busy", "Rotasi lain sedang berjalan.");
-  if (coolingUntil > now) {
+  // ignoreCooldown is the caller vouching that the wait protects nothing: the
+  // reactive hook passes it when the previous hop's fresh address was already
+  // refused (proven spent), and the manual API passes it for explicit operator
+  // intent. Single-flight (busy) and the hourly cap still apply — this flag
+  // only waives the pacing wait, never the concurrency or volume guards.
+  if (!ignoreCooldown && coolingUntil > now) {
     return skip("cooling", `Rotasi berikutnya boleh ${Math.ceil((coolingUntil - now) / 1000)}s lagi.`);
   }
   if (!withinHourlyCap(now)) {

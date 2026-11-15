@@ -10,6 +10,10 @@
 
 ### Changed
 
+- Cooldown pacing ends where evidence begins: once the previous hop's fresh
+  address is refused again, the next quota 429 hops immediately instead of
+  waiting out `cooldownMs`. Manual rotations always skip the cooldown wait. The
+  breaker (`ROTATION_INEFFECTIVE_LIMIT`, default 3) remains the futility cap.
 - The reactive rotator parks itself after `ROTATION_INEFFECTIVE_LIMIT` (default
   `3`) consecutive quota-429 rotations whose fresh egress address is refused
   again — the measured shared-WARP-pool case, where every `/64` the pool hands

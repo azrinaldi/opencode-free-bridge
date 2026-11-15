@@ -398,7 +398,7 @@ describe("429 → egress rotation → retry (server flow)", () => {
     }
   });
 
-  it("parks the reactive rotator after 3 consecutive rotations that still 429 (circuit breaker)", { timeout: 30000 }, async () => {
+  it("parks the reactive rotator after 3 consecutive rotations that still 429 (circuit breaker)", { timeout: 15000 }, async () => {
     // Every rotation succeeds at changing the IP, but upstream refuses the
     // fresh address too — the measured "WARP pool collectively spent" case.
     // After ROTATION_INEFFECTIVE_LIMIT (3) fruitless hops the bridge must stop
@@ -421,17 +421,14 @@ describe("429 → egress rotation → retry (server flow)", () => {
       });
 
     // Upstream refuses EVERY address tonight: initial attempt and every
-    // post-rotation retry get the quota 429. The cooldown floor is 5s
-    // (readEffective clamps file/env values to >= 5000), so consecutive
-    // reactive rotations must be spaced out; real trips accumulate across
-    // minutes, the test compresses them with 5.1s gaps.
+    // post-rotation retry get the quota 429. No cooldown waits here: once the
+    // first rotation's fresh address is refused (counter > 0), the reactive
+    // hook bypasses the cooldown by design — "the newest IP still 429s, hop
+    // again right away" — and the breaker is what stops the sequence.
     mockFetchImpl = async () => UP429();
-    process.env.WARP_ROTATE_COOLDOWN_MS = "5000";
     rotator.__setProbeImpl(async () => ({ ip: `203.0.113.${Date.now() % 250}`, error: null }));
-    const cooldownWait = () => new Promise((r) => setTimeout(r, 5100));
     try {
       for (let i = 0; i < 3; i += 1) {
-        if (i > 0) await cooldownWait();
         const res = await post();
         assert.equal(res.status, 429, `attempt ${i + 1}: fresh IP also refused`);
         assert.equal(rotator.describe().rotations, i + 1, `attempt ${i + 1}: exactly one rotation ran`);
@@ -445,7 +442,6 @@ describe("429 → egress rotation → retry (server flow)", () => {
       assert.equal(health.body.egress.rotator.rotationIneffectiveLimit, 3);
     } finally {
       rotator.__setProbeImpl(null);
-      delete process.env.WARP_ROTATE_COOLDOWN_MS;
       // Clear the module-level breaker so other tests start clean: a manual
       // rotate resets the counter (operator intent), cooldown may 409 it.
       const manual = await httpRequest(port, "POST", "/api/rotator", { rotate: true }).catch(() => null);
