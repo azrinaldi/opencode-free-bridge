@@ -820,6 +820,58 @@ services:
   (`install.sh`) next to the warp sidecar is the low-friction path. The
   all-in-Docker topology earns its keep on servers.
 
+#### On CasaOS
+
+CasaOS installs a compose app through its UI: **App Management → Install →
+Custom install → paste the YAML**. Use `docker-compose.example.yml` as the
+base, then adapt these four things — a compose pasted verbatim leaves the app
+invisible from your LAN and the WARP hop dead:
+
+1. **Port binding.** CasaOS's dashboard and your LAN clients cannot reach a
+   `127.0.0.1:20129:20129` binding (that is loopback *of the CasaOS host*).
+   The bridge has no authentication, so think before you widen it:
+   - Clients only on the same host (9Router/LiteLLM in another container on
+     this machine): keep `127.0.0.1:20129:20129`, and point those clients at
+     the container-to-container address `http://bridge:20129/v1` instead —
+     put both apps in the same compose project so the name resolves.
+   - Clients on other devices of your LAN: bind to the host's LAN IP, e.g.
+     `192.168.1.10:20129:20129` (narrower than `0.0.0.0`), and accept that
+     everything on that network can use the bridge.
+2. **The WARP hop needs the Docker API on TCP, not the socket.** Bun's fetch
+   cannot talk to a unix socket, so `WARP_ROTATE_CMD` posts to
+   `host.docker.internal:2375`. On the CasaOS host, publish dockerd on
+   loopback with a systemd drop-in (CasaOS uses the system docker):
+
+   ```bash
+   # /etc/systemd/system/docker.service.d/99-local-api.conf
+   [Service]
+   ExecStart=
+   ExecStart=/usr/bin/dockerd -H fd:// -H tcp://127.0.0.1:2375 --containerd=/run/containerd/containerd.sock
+   ```
+
+   `systemctl daemon-reload && systemctl restart docker` (CasaOS containers
+   with `restart: unless-stopped` come back on their own). Loopback-only, so
+   it is reachable from the host itself and, through `host-gateway`, from the
+   bridge container. The safer alternative is a
+   [`tecnativa/docker-socket-proxy`](https://github.com/Tecnativa/docker-socket-proxy)
+   limited to `CONTAINERS=1`, pointed at by `DOCKER_HOST`.
+3. **If a WARP sidecar already runs on the CasaOS host** (the common
+   `caomingjun/warp` app), do not install a second one: drop the `warp`
+   service from the compose, point the bridge's egress at the existing one
+   (`http://<host-lan-ip>:1080` if its gost port is published, or the
+   container name if you move it into the same compose project), and keep the
+   `WARP_ROTATE_CMD` container name matching (`/containers/<name>/kill`).
+4. **App metadata.** CasaOS reads port and icon info from `x-casaos` labels
+   for its dashboard tiles; without them the app still runs and the UI lists
+   it, just without a clickable web-UI link. Open the panel manually at
+   `http://<host-ip>:20129/`.
+
+After install: open the bridge panel, set the egress to the warp gost
+(`http://warp:1080` same-project, or the existing container/host address),
+and if you use the rotator, set the command in the panel or keep
+`WARP_ROTATE_CMD` from the compose. The health checks in the compose show in
+CasaOS as the app's running state.
+
 ## Troubleshooting
 
 ### `403` with "detected abusive traffic" / `Detect Abuse Traffic` (IP-level block)
