@@ -61,6 +61,115 @@ spent. The other three members really were spent; the phone was not.
   it sent clients into a 404 that burned their burst quota.
 
 ## [Unreleased]
+
+### Container image published to GHCR
+
+Every `v*` tag builds and pushes `ghcr.io/luqman-v1/ocb` (amd64 + arm64) via
+`.github/workflows/docker-publish.yml`: semver and `latest` tags, GHA layer
+cache, and an in-image `transport-fingerprint.js --check` proving the pinned
+`oven/bun:1.4.3-slim` base before the manifest is readable. `docker-compose.example.yml`
+ships a ready deployment: the bridge image plus a `caomingjun/warp` sidecar
+(GOST HTTP proxy on :1080), the rotator driving the sidecar's re-registration
+through the Docker API, loopback-only publishing, and all state in volumes.
+
+### Reactive egress rotation (WARP hop on 429)
+
+A capacity `429` now has an action behind it, not just a truthful `Retry-After`.
+
+The allowance is keyed to the egress IP, and a pool only helps when the operator
+can supply several proxy URLs. A WARP-style tunnel instead re-allocates its
+address on demand: reconnecting yields a fresh `/64` behind the same (or no)
+proxy URL. `rotator.js` drives that: on a capacity 429 the bridge runs the
+operator's rotate command once, polls the exit IP until it differs from the
+pre-rotation address (≤45 s), clears the egress cooldown, and replays the
+request once on the new address — a successful hop answers 200 and the client
+never sees the refusal.
+
+- New module `rotator.js` (tolerantly loaded like `proxy.js`; a missing module
+  degrades to "rotator disabled" and the plain 429 passthrough). Config in
+  `<state dir>/rotator.json` (mode `0600`); env overrides `WARP_ROTATE_CMD`,
+  `WARP_ROTATE_TIMEOUT_MS`, `WARP_ROTATE_COOLDOWN_MS`, `WARP_ROTATE_PROBE_URL`
+  lock the panel like `UPSTREAM_PROXY_URL` does.
+- `server.js` hooks the single-egress 429 path before the generic error branch:
+  rotation → one retry on the same request. Skipped when the rotator is
+  disabled, cooling (default 75 s between hops, capped at 20/hour), the client
+  is gone, or a ≥2-entry pool is active — the pool walk already changes IP
+  without a hop. 403/ip-abuse is never hopped on.
+- Panel section *Rotator egress (WARP hop)* at `/` (status, command, manual
+  hop), backed by `GET/POST /api/rotator` behind the existing
+  `adminRequestError` guard. The command string is write-only: reads report
+  `commandConfigured`, never the command itself.
+- `/health` → `egress.rotator` (`enabled`, `rotations`, `coolingForMs`,
+  `lastResult` with the from→to IPs).
+- The exit-IP probe rides the same egress the requests use: through the pinned
+  proxy via `proxy.netFetch`, or direct when none is configured (TUN mode).
+  A direct-only probe would read the host's own address and never see the hop.
+- Same-family hop verification (live-tested): the default `cdn-cgi/trace`
+  probe answers over either address family, so a v4→v6 flip between polls
+  would fake a hop (or mask one). Success now demands a same-family difference.
+- Bare-address probe bodies parse: `ip=…` (cdn-cgi/trace), JSON `{"ip":"…"}`,
+  and single-line bare echoes (`icanhazip.com`-style) are all accepted;
+  anything else is a parse error, never a guess.
+- Live WARP facts captured in the README (*Verified behaviors*): WARP pins the
+  IPv4 egress per account while MASQUE reconnects rotate the IPv6 /64 (probe
+  an IPv6 endpoint); WireGuard pins the device address entirely (a
+  disconnect/connect cycle is a no-op hop — force MASQUE); the rotate command
+  runs under a shell, so `&&` chains work, and should trail with a short
+  `sleep` so the first poll does not race the reconnect. End-to-end hop
+  verified in ~6 s on a Windows WARP+ host.
+- Test isolation fix found during that live test: the rotator suites reset
+  config state before pointing `OPENCODE_BRIDGE_STATE_DIR` at their temp dir,
+  so running them beside a live bridge deleted the operator's real
+  `rotator.json`. The env is now set in `beforeEach` before any reset, with a
+  loud invariant guard in `test/rotator-429.test.js`.
+- Known Bun quirk fixed en route: `req.destroyed` is `true` on any fully-read
+  request, so client-disconnect detection must check `req.socket`, not the
+  stream state.
+- Panel dashboard: a live-summary section at the top of `/` polls `/health`
+  every 15 s and reports the upstream gate status (with the throttled-until /
+  ip-blocked-since detail), the active free-model count, rotator state, and a
+  per-egress traffic table for the day. Read-only, no new endpoints; the table
+  stays empty with an honest message until the first request of the day.
+- `GET /api/egress-ip` (same `adminRequestError` guard): probes
+  `cdn-cgi/trace` through the *active* egress and returns the address upstream
+  sees, so the dashboard's "IP egress" line always reflects what inference
+  requests leave through — WARP TUN direct, the pinned proxy, or a pool
+  member. Probes are shared per 15 s dashboard cycle, not per render.
+- Rotation history: every rotator attempt (hop, command failure, and skip
+  with its reason) is kept in memory (last 50), exposed as `history` in
+  `GET /api/rotator`, and drawn under the rotator form in the panel — newest
+  first, timestamped, tagged `manual` vs `429`, showing `fromIp → toIp` or
+  the failure/skip reason. Before this, a successful reactive hop was only
+  visible as one stdout line; skipped 429 hops were invisible entirely.
+- 429 classification before the rotator hook: upstream answers at least two
+  failures with status 429 — the per-IP free allowance (`FreeUsageLimitError`,
+  where an IP hop genuinely helps) and a single model's capacity
+  (`RateLimitError "Endpoint is unavailable"`, where no IP can make a busy
+  model less busy). The hook now reads the body once and rotates only on the
+  quota kind; capacity 429s pass through untouched, verbatim, including their
+  Retry-After. Unparseable 429 bodies keep the historical quota behavior.
+- `ECONNRESET` while a WARP hop is in flight is classified as expected behavior,
+  not a bridge fault: a hop disconnects the tunnel for ~10s, so client requests
+  whose sockets are mid-flight through the TUN die with `ECONNRESET`. The bridge
+  now logs one warn line and answers the client `503` with `Retry-After: 10`
+  ("egress sedang di-hop") instead of a generic `500` exception. An `ECONNRESET`
+  with no rotation busy keeps the old generic-500 path.
+- Panel: "Log bridge" tab. A bounded in-memory ring buffer (`LOG_BUFFER_LINES`,
+  default 500) captures every `console.log/warn/error` line the process prints —
+  the same lines journald/docker logs keep — and `GET /api/logs?since=<ts>`
+  serves them incrementally (admin guard, GET/HEAD only). The panel draws them
+  in a terminal-styled box with auto-refresh (5s), manual refresh, Copy, and
+  timestamps; older lines fall off, full history stays with the service manager.
+  Before this, the only way to see a gate refusal or a rotation as it happened
+  was the service's stdout.
+- Panel: "Ringkasan live" redrawn as four status cards (gate, egress IP, free
+  models, WARP rotator) — the glanceable facts, with the gate card the only one
+  that takes state color. Usage table gains a horizontal-scroll wrapper so a
+  390px phone no longer pushes the page wide.
+- Tests: `test/log-buffer.test.js` (capture levels, formatting, ring discipline,
+  passthrough), plus the existing suites. 239 pass / 6 pre-existing Windows
+  failures (installer, node-refusal, NTFS 0600).
+
 A pool member no longer burns its allowance over the address family the gateway refuses.
 
 The free tier refuses IPv6 egress and accepts IPv4: the same request, from the

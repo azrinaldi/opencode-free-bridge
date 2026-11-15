@@ -1,0 +1,103 @@
+# Deployment example: opencode-free-bridge from GHCR + a WARP sidecar egress.
+#
+#   cp docker-compose.example.yml docker-compose.yml
+#   docker compose up -d
+#
+# Or the minimal variant (no WARP sidecar): keep only the `bridge` service,
+# drop the `warp` service and the two WARP_* environment lines, and if you do
+# not use an egress proxy at all, nothing else changes.
+#
+# The bridge publishes on 127.0.0.1 only: it has no authentication (the API
+# key is the literal string "public"), so 0.0.0.0 would expose an open relay
+# to the LAN. Clients connect to http://127.0.0.1:20129/v1.
+
+services:
+  bridge:
+    image: ghcr.io/luqman-v1/ocb:latest
+    restart: unless-stopped
+    depends_on:
+      warp:
+        condition: service_healthy
+    environment:
+      PORT: "20129"
+      HOST: "0.0.0.0"
+      OPENCODE_CACHE_DIR: /data/cache
+      # The panel writes the egress proxy and rotator command here. Without
+      # this volume the settings are lost on every `docker compose up -d`.
+      OPENCODE_BRIDGE_STATE_DIR: /data/state
+      # The image is the unit of deployment: an in-place self-update would be
+      # reverted by the next pull. Upgrade by pulling a newer tag instead
+      # (docker compose pull && docker compose up -d).
+      AUTO_UPDATE: "0"
+      # Reactive WARP hop (rotator): on a quota 429 the bridge restarts the
+      # warp sidecar's main process through the Docker API; its entrypoint
+      # re-registers (license persisted in the warp-state volume) and
+      # reconnects, which allocates a fresh WARP /64. The rotator then polls
+      # the exit IP through the SAME egress (http://warp:1080, set once in the
+      # panel or pre-seed it by calling POST /api/proxy after start).
+      #
+      # This needs the Docker API reachable WITHOUT the socket (Bun's fetch
+      # has no unix-socket support): dockerd publishing 127.0.0.1:2375 on the
+      # host, or a docker-socket-proxy. host.docker.internal resolves to the
+      # host on Docker Desktop natively; the extra_hosts line covers Linux.
+      WARP_ROTATE_CMD: >-
+        bun -e "await fetch('http://' + (process.env.DOCKER_HOST || 'host.docker.internal') + ':2375/containers/warp/kill?signal=HUP', {method:'POST'})"
+    volumes:
+      - bridge-cache:/data/cache
+      - bridge-state:/data/state
+    ports:
+      - "127.0.0.1:20129:20129"
+    healthcheck:
+      test:
+        - CMD
+        - bun
+        - -e
+        - "fetch('http://127.0.0.1:'+(process.env.PORT||'20129')+'/health').then(r => { if (!r.ok) process.exit(1) }).catch(() => process.exit(1))"
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  # WARP tunnel fronting an HTTP proxy. GOST (the image's default
+  # GOST_ARGS=-L :1080) serves HTTP AND SOCKS5 on the same port, so Bun's
+  # HTTP-only proxy support speaks to it directly. Set the bridge's egress to
+  # http://warp:1080 once (panel → URL proxy → Simpan dan pakai).
+  #
+  # Needs NET_ADMIN (it builds a TUN) — that is why this service drops fewer
+  # capabilities than the bridge. WARP_LICENSE_KEY optionally pins your
+  # WARP+ account (readable via `docker inspect` — keep it on a host only you
+  # control).
+  warp:
+    image: caomingjun/warp:latest
+    container_name: warp
+    restart: unless-stopped
+    environment:
+      # WARP_LICENSE_KEY: "xxxxx-xxxxx-xxxxx-xxxxx"
+      GOST_ARGS: "-L :1080"
+    volumes:
+      - warp-state:/var/lib/cloudflare-warp
+    cap_add:
+      - NET_ADMIN
+    sysctls:
+      - net.ipv6.conf.all.disable_ipv6=0
+    healthcheck:
+      test:
+        - CMD
+        - sh
+        - -c
+        - "curl -x http://127.0.0.1:1080 -fsS https://www.cloudflare.com/cdn-cgi/trace | grep -q warp=on"
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+
+volumes:
+  bridge-cache:
+  bridge-state:
+  warp-state:

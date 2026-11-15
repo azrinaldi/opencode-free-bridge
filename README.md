@@ -100,18 +100,50 @@ uncommitted or unpushed files) instead of downloading from GitHub. Force a
 download with `SOURCE=remote bash install.sh`.
 
 The server listens on `http://127.0.0.1:20129` by default.
-Open `http://127.0.0.1:20129/` for the panel: it shows the live egress state and sets
-an HTTP proxy for every outbound request. See [Egress proxy](#egress-proxy).
+Open `http://127.0.0.1:20129/` for the panel: a live-summary dashboard (four
+status cards — upstream gate status, the egress IP upstream sees, active
+free-model count, rotator state — plus today's per-egress traffic, refreshed
+every 15 s), a "Log bridge" tab (the last 500 console lines from memory,
+auto-refreshed — full history stays with journald / docker logs), the live
+egress state, and the form that sets an HTTP proxy for every outbound request.
+See [Egress proxy](#egress-proxy).
 
 ### Docker
+
+A prebuilt image is published to GHCR on every version tag (multi-arch:
+`linux/amd64` + `linux/arm64`), built by GitHub Actions with the pinned
+`oven/bun:1.4.3-slim` base and the TLS fingerprint verified inside the image
+before push. No Docker build on your host is needed:
+
+```bash
+docker pull ghcr.io/luqman-v1/ocb:latest
+```
+
+Tags: `latest` (newest tagged release), `2.4.0` / `2.4` (semver, per release),
+`edge` (main-branch builds via manual workflow dispatch). The first `docker
+pull` may need the package made public once: after the workflow runs, open
+`https://github.com/luqman-v1?tab=packages`, select `ocb`, *Package settings*
+→ *Change visibility* → *Public* (or `docker login ghcr.io` with a PAT that
+has `read:packages` to stay private).
 
 The repository ships a `Dockerfile` and a `docker-compose.yaml` for container
 deployments (single host, no orchestrator needed):
 
 ```bash
-git clone https://github.com/azrinaldi/opencode-free-bridge.git
-cd opencode-free-bridge
+git clone https://github.com/luqman-v1/ocb.git
+cd ocb
 docker compose up -d
+```
+
+A ready-made deployment example — the bridge from GHCR plus the
+[`caomingjun/warp`](https://github.com/cmj2002/warp-docker) sidecar as a
+hoppable egress, wired for the reactive WARP rotation — lives in
+[`docker-compose.example.yml`](docker-compose.example.yml):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/luqman-v1/ocb/main/docker-compose.example.yml -o docker-compose.yml
+docker compose up -d
+# then open http://127.0.0.1:20129/ and set the egress to http://warp:1080
 ```
 
 The bridge is then reachable at `http://127.0.0.1:20129/v1` (API key `public`),
@@ -146,6 +178,18 @@ docker compose build --pull && docker compose up -d
 
 Plain `docker run` works too — set `HOST=0.0.0.0` and publish the port
 yourself:
+
+```bash
+docker run -d --name opencode-free-bridge \
+  -p 127.0.0.1:20129:20129 \
+  -e OPENCODE_CACHE_DIR=/data/cache \
+  -e OPENCODE_BRIDGE_STATE_DIR=/data/state \
+  -v opencode-free-bridge-cache:/data/cache \
+  -v opencode-free-bridge-state:/data/state \
+  ghcr.io/luqman-v1/ocb:latest
+```
+
+Or build the image yourself from the checkout:
 
 ```bash
 docker build -t opencode-free-bridge .
@@ -472,6 +516,11 @@ Before running the 4 live drills, `gate-drill.js` sends a single CLI-shaped cont
 | `UPSTREAM_RELAY_URL` | _(unset)_ | Route inference through an egress relay (`x-relay-target` / `x-relay-path` contract); empty = direct. See [Optional egress relay](#optional-egress-relay) |
 | `UPSTREAM_PROXY_URL` | _(unset)_ | Operator-level default for the egress proxy (`http://[user:pass@]host:port`). When set it wins over the panel and locks runtime edits. See [Egress proxy](#egress-proxy) |
 | `PANEL_ALLOWED_HOSTS` | _(unset)_ | Extra `Host` names the panel and `/api/proxy` accept (comma-separated), for a reverse proxy in front of the bridge. Loopback names and the configured `HOST` are always accepted |
+| `WARP_ROTATE_CMD` | _(unset)_ | Command run once on a quota 429 (`FreeUsageLimitError`; capacity 429s pass through) to change the egress IP (WARP reconnect / hop CLI). When set it wins over the panel and locks runtime edits. See [Reactive egress rotation](#reactive-egress-rotation-warp-hop-on-429) |
+| `LOG_BUFFER_LINES` | `500` | Size of the in-memory log ring buffer served to the panel's Log bridge tab (`/api/logs`). Oldest lines fall off; the full history remains with the service manager (journald, docker logs, or the foreground terminal). |
+| `WARP_ROTATE_TIMEOUT_MS` | `45000` | Whole-rotation deadline: command run + exit-IP polling. The original 429 passes through when the IP has not changed by then |
+| `WARP_ROTATE_COOLDOWN_MS` | `75000` | Minimum gap between two rotations (manual or reactive), protecting the tunnel from hop storms |
+| `WARP_ROTATE_PROBE_URL` | `https://www.cloudflare.com/cdn-cgi/trace` | IP-echo endpoint polled during a rotation; probed through the pinned proxy when one is configured, direct otherwise (TUN mode) |
 | `AUTO_UPDATE` | `1` | Poll GitHub for bridge updates every 6 hours (automatically skipped inside a `.git` checkout; set `0` to disable) |
 | `ALLOW_NODE` | _(unset)_ | Set `ALLOW_NODE=1` to bypass the startup Bun check for offline tests |
 
@@ -620,6 +669,156 @@ credential to ask whether the proxy is up.
 The proxy applies *in addition to* the relay: with both configured, the request
 is still sent to `UPSTREAM_RELAY_URL`, and that connection is dialled through
 the proxy.
+
+### Reactive egress rotation (WARP hop on 429)
+
+A pool needs several egress *URLs*. A WARP-style tunnel instead changes the
+address *behind* one URL (or no URL at all, in TUN mode): reconnecting the
+tunnel yields a fresh `/64` allocation. When you configure a rotate command, the
+bridge uses it on a capacity `429` — the one status that means *transport and
+request shape passed, only this IP's allowance is spent*:
+
+```bash
+# configure once (or use the panel section "Rotator egress (WARP hop)")
+curl -s http://127.0.0.1:20129/api/rotator \
+  -H "Content-Type: application/json" \
+  -d '{"command":"warp-cli disconnect && warp-cli connect"}'
+
+# trigger a hop manually
+curl -s http://127.0.0.1:20129/api/rotator \
+  -H "Content-Type: application/json" \
+  -d '{"rotate":true}'
+
+# watch what the last hop did
+curl -s http://127.0.0.1:20129/health | jq .egress.rotator
+```
+
+On a 429 the bridge runs the command once, polls the exit IP
+(`https://www.cloudflare.com/cdn-cgi/trace` by default). Only the *quota* kind
+of 429 reaches the rotator: upstream answers both a spent per-IP allowance
+(`FreeUsageLimitError`) and a busy model (`RateLimitError "Endpoint is
+unavailable"`) with the same status, but no IP makes a busy model less busy,
+so the body is classified first and capacity 429s pass through untouched.
+The probe leaves
+through the *same egress the requests use*: with a single proxy configured
+it goes through that proxy (`proxy.netFetch`); with none it goes direct —
+the TUN-mode case, where "direct" already leaves through WARP. When the
+address actually changed, the bridge clears the egress cooldown and replays
+the request once — the client sees 200 and never the 429. If the IP has not
+changed within `WARP_ROTATE_TIMEOUT_MS` (default 45 s), the original 429
+passes through with upstream's `Retry-After`.
+
+- **Env overrides:** `WARP_ROTATE_CMD` (locks the panel, like
+  `UPSTREAM_PROXY_URL`), `WARP_ROTATE_TIMEOUT_MS`, `WARP_ROTATE_COOLDOWN_MS`
+  (default 75 000 ms between hops), `WARP_ROTATE_PROBE_URL`.
+- **Guard rails:** one rotation per request, single-flight, 20 hops/hour, and a
+  skip when a ≥2-entry pool is active (the pool walk already changes IP without
+  a hop). 403/ip-abuse refusals are never hopped on — a rotation cannot fix a
+  shape problem and hopping only prolongs an IP penalty.
+- **History:** every attempt — hop, command failure, and skip with its reason —
+  is kept in memory (last 50), exposed as `history` in `GET /api/rotator`, and
+  drawn under the rotator form in the panel (newest first, `manual` vs `429`
+  tag, `fromIp → toIp` or the failure reason). In-memory only: it resets on
+  restart, and the command string never appears in entries.
+- **Config:** `<state dir>/rotator.json`, mode `0600`. The command string is
+  write-only: the panel, `/api/rotator` and `/health` report *that* one exists,
+  never *what* it is.
+
+#### Verified behaviors (live warp-cli testing, Windows host)
+
+Measured on a real WARP+ client (Unlimited account, Windows 10), so the notes
+below are observed facts, not guesses:
+
+- **The rotate command must run through a shell and wait.** `execFile` uses the
+  shell, so `cmd1 && cmd2` works; append `sleep 4` (or `timeout /t 4
+  /nobreak >nul` in cmd, but note Git-Bash `sleep` if the bridge inherits that
+  PATH) so the probe's first poll does not race the reconnect. A hop was
+  verified end-to-end in ~6 s with `warp-cli disconnect && warp-cli connect &&
+  sleep 4`.
+- **IPv4 egress is pinned per account; IPv6 /64 rotates per handshake (MASQUE).**
+  Across many disconnect/connect cycles the v4 echo returned the same
+  `104.28.x.x` every time, while the v6 address rotated /64s
+  (`2a09:bac1::/64 ↔ 2a09:bac5::/64`). Consequence: **probe an IPv6-reachable
+  endpoint** (e.g. `https://ipv6.icanhazip.com`) — the default
+  `cdn-cgi/trace` may answer over either family, which the rotator now guards
+  against (same-family comparison; a v4→v6 flip is never counted as a hop).
+- **Protocol decides whether a hop changes the address at all.** With
+  **MASQUE** (the client default) each reconnect allocates a fresh /64 — a
+  real hop. With **WireGuard** the device address is pinned and five reconnect
+  cycles in a row produced the identical v6 address — a no-op hop. Verify your
+  protocol with `warp-cli tunnel stats`; force MASQUE with
+  `warp-cli tunnel protocol set MASQUE` (the switch itself drops the tunnel;
+  `warp-cli connect` afterwards).
+- **A dead egress proxy starves the probe.** While a stale proxy was pinned in
+  the panel, every probe failed ("Unable to connect") and the rotation timed
+  out even though the hop itself had succeeded — the probe rides the egress by
+  design, so check `/health` → `egress.mode` first when a rotation "never"
+  observes a change.
+- **Bare-address probe bodies are accepted.** `ip=…` (cdn-cgi/trace), JSON
+  `{"ip":"…"}`, and bare single-line echoes (`icanhazip.com` and friends) all
+  parse; anything else is rejected with a parse error rather than guessed.
+- **The hop drops in-flight requests through the tunnel.** Disconnecting the
+  tunnel resets every socket mid-flight, so concurrent client requests die with
+  `ECONNRESET` while the hop runs (~10s). The bridge classifies that as expected
+  rotator behavior: one warn line in the log, and the client gets `503` with
+  `Retry-After: 10` instead of a generic `500`. Only an `ECONNRESET` while the
+  rotator is *idle* is a real transport fault.
+
+#### In Docker
+
+The bridge never installs or owns WARP — the tunnel lives wherever the operator
+runs it. A common pairing is the [`caomingjun/warp`](https://github.com/cmj2002/warp-docker)
+sidecar, and it fits directly: its GOST default (`GOST_ARGS=-L :1080`) serves
+**HTTP and SOCKS5 on the same port**, so Bun's HTTP-only proxy support speaks
+to it without extra front ends.
+
+```yaml
+# bridge container — the essentials
+services:
+  bridge:
+    # ... build/port/volumes as in the compose file above ...
+    environment:
+      OPENCODE_BRIDGE_STATE_DIR: /data/state
+      WARP_ROTATE_CMD: >-
+        bun -e "await fetch('http://' + (process.env.DOCKER_HOST || 'host.docker.internal') + ':2375/containers/cloudflare-warp/kill?signal=HUP', {method:'POST'})"
+    extra_hosts:            # Linux only; Docker Desktop resolves it natively
+      - "host.docker.internal:host-gateway"
+```
+
+- **Egress:** set the panel's *URL proxy* to `http://cloudflare-warp:1080`
+  (same compose network) or `http://host.docker.internal:1080` (host-published
+  port). Verify first:
+  `curl -x http://127.0.0.1:1080 https://www.cloudflare.com/cdn-cgi/trace` must
+  show `warp=on` (gost auto-detects HTTP vs SOCKS per connection, so one port
+  serves both).
+- **The rotate command runs inside the bridge container** (`execFile`), so a
+  host `warp-cli` is not callable. `warp-cli` exists only *inside* the warp
+  container; reach it through the Docker API instead. Simplest: publish
+  dockerd on `127.0.0.1:2375` (`DOCKER_HOST`) or mount the container's socket
+  if it is a Linux daemon, and restart the warp container as the hop —
+  `entrypoint.sh` re-registers (license key is persisted in the
+  `/var/lib/cloudflare-warp` volume) and re-connects, which allocates a fresh
+  `/64`. `POST /containers/<name>/kill?signal=HUP` restarts the main process
+  without recreating; a full `restart` works too.
+- **A container does not ride the host's WARP TUN.** Container egress leaves
+  through Docker's own NAT, so "direct probe = already through WARP" only holds
+  when the bridge runs natively on the WARP machine. Inside a container the
+  probe is correct because it rides the configured egress (previous section) —
+  with `http://cloudflare-warp:1080` as the egress, the probe and every request
+  leave through WARP.
+- **Loopback trap:** with the compose file above publishing `1080` on
+  `0.0.0.0`, any LAN host can use the WARP exit. Keep gost reachable only from
+  the bridge: same network + no published port (drop the `ports:` block), or
+  publish `127.0.0.1:1080:1080`.
+- **License note:** `WARP_LICENSE_KEY` in plain env/compose is readable via
+  `docker inspect` by anyone with Docker access — same trust level as the
+  bridge's proxy credentials, keep both on a host only you control.
+- **State persists:** `rotator.json` lives in `/data/state`
+  (`OPENCODE_BRIDGE_STATE_DIR`), already a compose volume — rotator config
+  survives `docker compose up -d` recreates like the proxy pool does.
+- **Desktop reality check:** on a Windows/macOS desktop the native install
+  (`install.sh`) next to the warp sidecar is the low-friction path. The
+  all-in-Docker topology earns its keep on servers.
 
 ## Troubleshooting
 

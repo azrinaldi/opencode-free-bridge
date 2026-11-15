@@ -20,6 +20,48 @@ const DNS_RESULT_ORDER = (() => {
 })();
 const http = require("http");
 const crypto = require("crypto");
+
+/**
+ * In-memory log ring buffer for the panel's "Log bridge" tab.
+ *
+ * Every `console.log/warn/error` line from this process lands here, so the
+ * panel can show what the operator would otherwise only see on the service's
+ * stdout (journalctl / docker logs / the foreground terminal). It hooks
+ * `console` once at startup: no call site changes, and formats that Bun's
+ * console would render (objects, %s style args) are flattened the same way
+ * Bun formats them for stdout. Bounded at LOG_BUFFER_LINES; oldest lines fall
+ * off. Nothing is written to disk — persistence belongs to the service manager
+ * (journald keeps the full history; this buffer only serves the panel).
+ */
+const LOG_BUFFER_LINES = parseInt(process.env.LOG_BUFFER_LINES || "500", 10);
+const logBuffer = [];
+let consoleHooked = false;
+function hookConsoleBuffer() {
+  if (consoleHooked) return;
+  consoleHooked = true;
+  const format = (args) =>
+    args
+      .map((a) => {
+        if (typeof a === "string") return a;
+        try {
+          return require("node:util").format(a);
+        } catch {
+          return String(a);
+        }
+      })
+      .join(" ");
+  for (const level of ["log", "warn", "error"]) {
+    const original = console[level].bind(console);
+    console[level] = (...args) => {
+      const text = format(args);
+      logBuffer.push({ at: Date.now(), level, text });
+      if (logBuffer.length > LOG_BUFFER_LINES) logBuffer.splice(0, logBuffer.length - LOG_BUFFER_LINES);
+      original(...args);
+    };
+  }
+}
+hookConsoleBuffer();
+
 let VERSION = "1.5.0";
 try {
   VERSION = require("./package.json").version || VERSION;
@@ -84,6 +126,13 @@ const PANEL_FALLBACK = {
 let proxy = loadLocalModule("proxy", PROXY_FALLBACK);
 let panel = loadLocalModule("panel", PANEL_FALLBACK);
 
+const ROTATOR_FALLBACK = {
+  describe: () => ({ enabled: false, busy: false, coolingUntil: 0, coolingForMs: 0, rotations: 0 }),
+  rotate: async () => ({ ok: false, skipped: "disabled", error: "rotator.js belum terpasang." }),
+  setConfig: () => ({ ok: false, error: "rotator.js belum terpasang. Jalankan ulang install.sh." }),
+};
+let rotator = loadLocalModule("rotator", ROTATOR_FALLBACK);
+
 /**
  * Local modules this server requires by relative path. The self-updater uses
  * this to refuse an update that would install a `server.js` whose imports are
@@ -122,7 +171,7 @@ async function repairMissingModules(dir = __dirname) {
   const fs = require("fs");
   const path = require("path");
   const required = new Set(localRequires(fs.readFileSync(path.join(dir, "server.js"), "utf8")));
-  for (const name of ["proxy.js", "panel.js"]) required.add(name);
+  for (const name of ["proxy.js", "panel.js", "rotator.js"]) required.add(name);
   const missing = [...required].filter((f) => !fs.existsSync(path.join(dir, f)));
   const repaired = [];
   const failed = [];
@@ -147,6 +196,7 @@ async function repairMissingModules(dir = __dirname) {
   if (repaired.length && path.resolve(dir) === path.resolve(__dirname)) {
     proxy = loadLocalModule("proxy", PROXY_FALLBACK);
     panel = loadLocalModule("panel", PANEL_FALLBACK);
+    rotator = loadLocalModule("rotator", ROTATOR_FALLBACK);
     console.log(`[opencode-free-bridge] Repaired missing module(s): ${repaired.join(", ")}`);
   } else if (repaired.length) {
     console.log(`[opencode-free-bridge] Repaired missing module(s): ${repaired.join(", ")}`);
@@ -223,6 +273,7 @@ const UPDATE_FILES = [
   "tunnel-doctor.sh",
   "proxy.js",
   "panel.js",
+  "rotator.js",
   "egress-proxy.js",
   "anthropic.js",
   "server.js",
@@ -529,6 +580,65 @@ function retryAfterMs(res) {
   const delta = at - Date.now();
   return delta > 0 ? delta : null;
 }
+
+/**
+ * Reactive egress rotation on a 429, behind the operator-configured rotator.
+ *
+ * Guarded so a rotation is paid for only when it can help:
+ *   - rotator disabled (no command configured) → no-op, caller answers 429;
+ *   - cooling / busy / hourly-capped → skipped, same as disabled;
+ *   - client already gone → a rotation would serve nobody;
+ *   - pool has ≥2 enabled entries → the pool walk below already tries other
+ *     addresses; a rotation would double-spend the same allowance budget.
+ *
+ * Returns true only when the exit IP actually changed, so the caller knows the
+ * retry left through a different address. Any failure is logged and the caller
+ * falls through to the plain 429 passthrough with its truthful Retry-After.
+ */
+async function maybeRotateOn429(req, res, egressState) {
+  const state = rotator.describe();
+  if (!state.enabled) return false;
+  if (state.coolingForMs > 0 || state.busy) {
+    console.warn(
+      `[opencode-free-bridge] Rotator skipped on 429: ${state.coolingForMs > 0 ? "cooling" : "busy"}`
+    );
+    return false;
+  }
+  // Client still there? `req.destroyed` is useless here: Bun marks an
+  // IncomingMessage destroyed once its body is fully consumed, which is the
+  // normal case, not a disconnect. The socket is the truth: destroyed or ended
+  // socket means nobody is listening for the answer, so a rotation would serve
+  // nobody. res.writableEnded catches a response already committed elsewhere.
+  if (res.writableEnded || res.destroyed || !req.socket || req.socket.destroyed) return false;
+
+  const poolState = proxy.describe().pool;
+  if (poolState && poolState.active && poolState.enabled > 1) return false;
+
+  console.warn(
+    `[opencode-free-bridge] 429 on egress ${
+      proxy.displayHost(egressState.egressUrl) || "direct"
+    }; rotating egress before retry`
+  );
+  const result = await rotator
+    .rotate({ egressUrl: egressState.egressUrl ?? null, trigger: "429" })
+    .catch((err) => ({
+      ok: false,
+      changed: false,
+      error: `rotator threw: ${err.message}`,
+    }));
+  if (!result.ok) {
+    console.warn(
+      `[opencode-free-bridge] Rotator failed or skipped (${result.skipped || "error"}): ${result.error}; answering 429`
+    );
+    return false;
+  }
+  // The exit IP changed. The egress URL itself is unchanged (TUN mode, or a
+  // local proxy in front of the tunnel), so the pool health key is the same —
+  // clearing its cooldown is what lets the retry actually use it.
+  proxy.markSuccess(egressState.egressUrl);
+  return true;
+}
+
 /**
  * Record a refusal against the egress that produced it.
  *
@@ -1815,6 +1925,32 @@ async function handleProxyApi(req, res, pathname) {
   if (pathname === "/api/proxy" && (req.method === "GET" || req.method === "HEAD")) {
     return send(200, proxy.describe());
   }
+
+  // `/api/egress-ip` — what address upstream sees right now. Probes
+  // cdn-cgi/trace through the ACTIVE egress (proxy.netFetch with the current
+  // proxy URL, direct when none), so the answer is the IP inference requests
+  // leave through — not the host's own address. GET-only and admin-guarded:
+  // it triggers one outbound request, and the panel is the only caller.
+  // WARP facts worth surfacing: warp=plus/on means the tunnel is up; the
+  // ip= field is the egress address that rotates on a hop.
+  if (pathname === "/api/egress-ip") {
+    if (req.method !== "GET" && req.method !== "HEAD") {
+      res.setHeader("Allow", "GET, HEAD");
+      return send(405, { error: "Gunakan GET untuk membaca IP egress." });
+    }
+    try {
+      const probe = require("./rotator").probeExitIp(
+        "https://www.cloudflare.com/cdn-cgi/trace",
+        8000,
+        proxy.getProxyUrl() || null
+      );
+      const { ip, error } = await probe;
+      return send(200, { ok: Boolean(ip), ip: ip || null, error: error || null, mode: proxy.describe().mode });
+    } catch (err) {
+      return send(502, { ok: false, ip: null, error: err.message, mode: proxy.describe().mode });
+    }
+  }
+
   if (req.method !== "POST") {
     res.setHeader("Allow", "GET, POST");
     return send(405, { error: "Gunakan GET untuk status atau POST untuk mengubah." });
@@ -1891,6 +2027,65 @@ async function handleProxyApi(req, res, pathname) {
   }
 
   return send(400, { error: "Body harus berisi 'url' (satu proxy) atau 'entries' (pool)." });
+}
+
+/**
+ * `/api/rotator` — status, config, and a manual trigger for the reactive
+ * egress rotator. Same admin surface rules as `/api/proxy`: JSON only, loopback
+ * Host, no credentials echoed. The command string is write-only: reads report
+ * `commandConfigured`, never the command itself.
+ */
+async function handleRotatorApi(req, res, pathname) {
+  const send = (status, body) => {
+    res.writeHead(status, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+    res.end(JSON.stringify(body));
+  };
+
+  if (req.method === "GET" || req.method === "HEAD") {
+    return send(200, rotator.describe());
+  }
+  if (req.method !== "POST") {
+    res.setHeader("Allow", "GET, POST");
+    return send(405, { error: "Gunakan GET untuk status atau POST untuk mengubah / memicu rotasi." });
+  }
+
+  let payload = {};
+  try {
+    const text = await readRequestBody(req, 64 * 1024);
+    payload = text ? JSON.parse(text) : {};
+  } catch (err) {
+    return send(err.statusCode === 413 ? 413 : 400, { error: `Body tidak valid: ${err.message}` });
+  }
+  if (!payload || typeof payload !== "object") {
+    return send(400, { error: "Body harus berupa objek JSON." });
+  }
+
+  // Manual trigger, e.g. the panel's "Rotasi sekarang" button. Shares the
+  // single-flight and cooldown guards with the reactive path, so this cannot
+  // stampede the tunnel even if clicked repeatedly. The probe rides the
+  // configured single proxy when one exists (same rule as the reactive path:
+  // the IP that matters is the one requests leave through).
+  if (payload.rotate === true) {
+    const result = await rotator
+      .rotate({ egressUrl: proxy.getProxyUrl() || null, trigger: "manual" })
+      .catch((err) => ({
+        ok: false,
+        changed: false,
+        skipped: "error",
+        error: err.message,
+      }));
+    return send(result.ok ? 200 : 409, result);
+  }
+
+  const configPatch = {};
+  for (const key of ["command", "timeoutMs", "cooldownMs", "probeUrl"]) {
+    if (Object.prototype.hasOwnProperty.call(payload, key)) configPatch[key] = payload[key];
+  }
+  if (Object.keys(configPatch).length === 0) {
+    return send(400, { error: "Body harus berisi 'rotate': true, atau kolom konfigurasi (command, timeoutMs, cooldownMs, probeUrl)." });
+  }
+  const result = rotator.setConfig(configPatch);
+  return send(result.ok ? 200 : 400, result);
 }
 
 function readRequestBody(req, maxBytes = MAX_BODY_BYTES) {
@@ -2014,7 +2209,54 @@ function handleRequest(req, res) {
     return res.end(req.method === "HEAD" ? undefined : html);
   }
 
-  if (pathname === "/api/proxy" || pathname === "/api/proxy/test") {
+  if (pathname === "/api/logs") {
+    const denied = adminRequestError(req);
+    if (denied) {
+      res.writeHead(403, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+      return res.end(JSON.stringify({ error: denied }));
+    }
+    if (req.method !== "GET" && req.method !== "HEAD") {
+      res.setHeader("Allow", "GET, HEAD");
+      res.writeHead(405, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+      return res.end(JSON.stringify({ error: "Endpoint log hanya GET/HEAD (read-only)." }));
+    }
+    const since = parseInt(new URL(req.url, "http://x").searchParams.get("since") || "0", 10) || 0;
+    const lines = logBuffer.filter((entry) => entry.at > since);
+    const body = JSON.stringify({
+      count: lines.length,
+      truncated: logBuffer.length >= LOG_BUFFER_LINES && lines.length === logBuffer.length,
+      lines,
+    });
+    res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+    return res.end(req.method === "HEAD" ? undefined : body);
+  }
+
+  if (pathname === "/api/rotator") {
+    const denied = adminRequestError(req);
+    if (denied) {
+      res.writeHead(403, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+      return res.end(JSON.stringify({ error: denied }));
+    }
+    if (req.method === "POST") {
+      const type = String(req.headers?.["content-type"] || "").split(";")[0].trim().toLowerCase();
+      if (type !== "application/json") {
+        res.writeHead(415, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+        return res.end(JSON.stringify({ error: "Content-Type harus application/json." }));
+      }
+    }
+    handleRotatorApi(req, res, pathname).catch((err) => {
+      if (res.headersSent) return res.destroy();
+      res.writeHead(500, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+      res.end(JSON.stringify({ error: `Kesalahan internal: ${err.message}` }));
+    });
+    return;
+  }
+
+  if (
+    pathname === "/api/proxy" ||
+    pathname === "/api/proxy/test" ||
+    pathname === "/api/egress-ip"
+  ) {
     const denied = adminRequestError(req);
     if (denied) {
       res.writeHead(403, { "Content-Type": "application/json", "Cache-Control": "no-store" });
@@ -2076,6 +2318,9 @@ function handleRequest(req, res) {
                   : "direct",
           ...(UPSTREAM_RELAY_URL ? { relay: relayLabel(UPSTREAM_RELAY_URL) } : {}),
           proxy: proxyState,
+          // Reactive egress rotator (WARP-style hop on 429). Presence here with
+          // `enabled: false` means the module is loaded but no command is set.
+          rotator: rotator.describe(),
           // Per-egress wire traffic and token accounting (usage.json). The
           // phone entry here is the mobile-data cost of the bridge today.
           ...(usageView ? { usage: usageView } : {}),
@@ -2537,6 +2782,82 @@ function handleRequest(req, res) {
             signal: abortController.signal,
           }, egressUrl());
           consumedErrorText = null;
+        }
+
+        // Reactive egress rotation (WARP-style hop). The free allowance is
+        // keyed to the IP upstream sees, so when the operator runs a tunnel
+        // rotator a 429 is the one place where a spent address can be exchanged
+        // for a fresh one and the same request retried, without the client ever
+        // seeing the refusal. Everything else (403 gate, ip-abuse, 5xx) is left
+        // to the branches below: a rotation cannot fix a shape problem, and
+        // hopping on an abuse block only prolongs the penalty.
+        //
+        // Not every 429 is a spent allowance. Upstream answers at least two
+        // other kinds with the same status: `RateLimitError "Endpoint is
+        // unavailable"` (a single model's capacity pressure — measured live;
+        // hopping IPs cannot make a busy model less busy) and, historically,
+        // the shape refusals the bridge now repairs pre-flight. The quota kind
+        // is `FreeUsageLimitError` (transport and shape accepted, allowance
+        // keyed to the IP). Read the body once here and classify: only a
+        // quota-shaped 429 reaches the rotator; a model-capacity 429 passes
+        // through to the client untouched, which also preserves its
+        // Retry-After for the generic branch below.
+        let quota429 = false;
+        let capacity429 = false;
+        if (upstreamRes.status === 429) {
+          let body429 = "";
+          try {
+            body429 = consumedErrorText ?? (await upstreamRes.text());
+            consumedErrorText = body429;
+          } catch {}
+          const type429 = (() => {
+            try {
+              const j = JSON.parse(body429);
+              return j?.error?.type || j?.type || "";
+            } catch {
+              return "";
+            }
+          })();
+          const msg429 = (() => {
+            try {
+              const j = JSON.parse(body429);
+              return j?.error?.message || j?.message || body429 || "";
+            } catch {
+              return body429 || "";
+            }
+          })();
+          if (type429 === "RateLimitError" || /endpoint is unavailable|try again/i.test(msg429)) {
+            capacity429 = true;
+          } else {
+            // Default: treat as the quota kind. FreeUsageLimitError matches
+            // explicitly; anything unparseable keeps the historical behavior
+            // (the allowance answer was observed without parseable JSON too).
+            quota429 = true;
+          }
+        }
+        if (quota429) {
+          const rotated = await maybeRotateOn429(req, res, egressState);
+          if (rotated) {
+            upstreamRes = await egressFetch(upstreamUrl, {
+              method: "POST",
+              headers: upstreamHeaders,
+              body: JSON.stringify(upstreamBody),
+              signal: abortController.signal,
+            }, egressState.egressUrl);
+            consumedErrorText = null;
+            if (upstreamRes.ok) {
+              proxy.markSuccess(egressState.egressUrl);
+              console.warn("[opencode-free-bridge] 429 cleared by egress rotation; upstream accepted the retry");
+            } else if (upstreamRes.status === 429) {
+              // Still spent on the fresh address too. The Retry-After must
+              // reach the client; the generic error branch below handles that
+              // because `upstreamRes` is what it reads.
+              recordEgressFailure(egressState, {
+                reason: "allowance 429 after rotation",
+                cooldownMs: retryAfterMs(upstreamRes) ?? null,
+              });
+            }
+          }
         }
 
         // Self-healing identity. A gate rejection is identified by the error
@@ -3330,6 +3651,34 @@ function handleRequest(req, res) {
           }
           return res.end();
         }
+        // A WARP hop disconnects the tunnel for ~10s, so any client request
+        // whose socket is mid-flight through the TUN dies with ECONNRESET.
+        // That is the rotator working as designed, not a bridge fault: log it
+        // at warn level and hand the client a retryable 503 instead of a
+        // generic 500 "exception" stack trace.
+        if (err?.code === "ECONNRESET" && rotator.describe().busy) {
+          console.warn(
+            "[opencode-free-bridge] request dropped by the WARP hop in flight (ECONNRESET through the tunnel); client can retry"
+          );
+          if (!res.headersSent) {
+            res.writeHead(503, {
+              "Content-Type": "application/json",
+              "Retry-After": "10",
+              "Cache-Control": "no-store",
+            });
+            return res.end(
+              JSON.stringify({
+                error: {
+                  message:
+                    "Egress sedang di-hop (rotasi WARP); koneksi terputus di tengah request. Ulangi beberapa detik lagi.",
+                  type: "server_error",
+                  code: 503,
+                },
+              })
+            );
+          }
+          return res.end();
+        }
         console.error("[opencode-free-bridge] exception:", err);
         if (!res.headersSent) {
           res.writeHead(500, { "Content-Type": "application/json" });
@@ -3462,6 +3811,12 @@ if (require.main === module) {
 
 module.exports = {
   VERSION,
+  // Test surface for the panel log buffer: the array the console hook pushes
+  // into. Read-only on purpose; tests drive it through console.log itself.
+  get logBuffer() {
+    return logBuffer;
+  },
+  LOG_BUFFER_LINES,
   // Kept for callers and tests written against the old frozen constants. These
   // are live views of the resolved profile, not snapshots.
   get FINGERPRINT_TOOL_NAMES() {

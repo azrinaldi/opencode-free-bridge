@@ -451,7 +451,7 @@ if [ -n "$(port_holder)" ]; then
   die "cannot bind port $PORT"
 fi
 
-for file in package.json server.js identity.js token-budget.js verify.js gate-drill.js transport-fingerprint.js transport-baseline.json tunnel-doctor.sh proxy.js panel.js egress-proxy.js THIRD_PARTY_NOTICES.md; do
+for file in package.json server.js identity.js token-budget.js verify.js gate-drill.js transport-fingerprint.js transport-baseline.json tunnel-doctor.sh proxy.js panel.js rotator.js egress-proxy.js THIRD_PARTY_NOTICES.md; do
   [ -f "$STAGE/$file" ] && mv -f "$STAGE/$file" "$BINDIR/$file"
 done
 chmod +x "$BINDIR/server.js" "$BINDIR/identity.js" "$BINDIR/verify.js" "$BINDIR/gate-drill.js" "$BINDIR/transport-fingerprint.js" "$BINDIR/tunnel-doctor.sh" "$BINDIR/egress-proxy.js" 2>/dev/null || true
