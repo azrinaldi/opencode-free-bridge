@@ -60,7 +60,7 @@ spent. The other three members really were spent; the phone was not.
   catalog-free id the gateway has stopped serving is no longer advertised —
   it sent clients into a 404 that burned their burst quota.
 
-## [Unreleased]
+## [2.5.0] — 2026-11-15
 
 ### Container image published to GHCR
 
@@ -211,7 +211,7 @@ the front of the pool was retried first while the rest of the pool idled.
   default.
 - `proxy.js`: comment wording only (an upstream suspend, not a specific host).
 
-## [Unreleased]
+## [2.5.0] — continued
 
 `429 FreeUsageLimitError` is also a tool-name filter.
 
