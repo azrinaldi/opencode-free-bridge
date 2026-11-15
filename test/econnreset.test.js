@@ -138,4 +138,46 @@ describe("ECONNRESET during a WARP hop", () => {
     rotator.__setProbeImpl(null);
     rotator.__reset({ keepConfig: true });
   });
+
+  it("answers the same 503 for a fresh dial refused while the tunnel is down", { timeout: 15000 }, async () => {
+    mockFetchImpl = async () => {
+      const err = new TypeError("Unable to connect. Is the computer able to access the url?");
+      err.code = "ConnectionRefused";
+      throw err;
+    };
+    rotator.__reset({ keepConfig: true });
+    let releaseProbe;
+    const gate = new Promise((resolve) => (releaseProbe = resolve));
+    rotator.__setProbeImpl(async () => {
+      await gate;
+      return { ip: "203.0.113.9", error: null };
+    });
+    fs.writeFileSync(
+      path.join(stateDir, "rotator.json"),
+      JSON.stringify({ command: "true", timeoutMs: 8000, cooldownMs: 1000 })
+    );
+    const hold = rotator.rotate({ egressUrl: null, trigger: "manual" });
+    let busySeen = rotator.describe().busy;
+    if (!busySeen) {
+      for (let i = 0; i < 20 && !busySeen; i++) {
+        await new Promise((r) => setTimeout(r, 50));
+        busySeen = rotator.describe().busy;
+      }
+    }
+    if (!busySeen) {
+      const entry = await Promise.race([hold, new Promise((r) => setTimeout(() => r({ timeout: true }), 500))]);
+      rotator.__setProbeImpl(null);
+      assert.fail("hold rotation never became busy; entry: " + JSON.stringify(entry));
+    }
+
+    const res = await post();
+    assert.equal(res.status, 503);
+    assert.equal(res.headers["retry-after"], "10");
+    assert.match(res.body.error.message, /rotasi WARP|di-hop/i);
+
+    releaseProbe();
+    await hold;
+    rotator.__setProbeImpl(null);
+    rotator.__reset({ keepConfig: true });
+  });
 });

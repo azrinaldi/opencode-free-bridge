@@ -3651,14 +3651,20 @@ function handleRequest(req, res) {
           }
           return res.end();
         }
-        // A WARP hop disconnects the tunnel for ~10s, so any client request
-        // whose socket is mid-flight through the TUN dies with ECONNRESET.
-        // That is the rotator working as designed, not a bridge fault: log it
-        // at warn level and hand the client a retryable 503 instead of a
-        // generic 500 "exception" stack trace.
-        if (err?.code === "ECONNRESET" && rotator.describe().busy) {
+        // A WARP hop disconnects the tunnel for ~10s, so client requests die
+        // two ways: a socket mid-flight through the TUN gets ECONNRESET, and a
+        // fresh dial while the tunnel is down gets ConnectionRefused. Both are
+        // the rotator working as designed, not a bridge fault: log at warn
+        // level and hand the client a retryable 503 instead of a generic 500
+        // "exception" stack trace.
+        const hopDeadTunnel =
+          rotator.describe().busy &&
+          (err?.code === "ECONNRESET" ||
+            err?.code === "ConnectionRefused" ||
+            err?.code === "ECONNREFUSED");
+        if (hopDeadTunnel) {
           console.warn(
-            "[opencode-free-bridge] request dropped by the WARP hop in flight (ECONNRESET through the tunnel); client can retry"
+            `[opencode-free-bridge] request dropped by the WARP hop in flight (${err.code} while the tunnel was down); client can retry`
           );
           if (!res.headersSent) {
             res.writeHead(503, {
