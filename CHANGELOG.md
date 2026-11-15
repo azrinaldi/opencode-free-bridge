@@ -1,5 +1,11 @@
 # Changelog
-## [Unreleased]
+## [2.6.0] — 2026-11-15
+
+The reactive WARP rotator learns when hops stop paying: live evidence showed a
+shared `/64` pool collectively quota-spent, where rotation changed the address
+every time and upstream refused every address. This release makes the bridge
+spend hops only while they can help, and classifies the tunnel's own dropouts
+honestly instead of as bridge faults.
 
 ### Fixed
 
