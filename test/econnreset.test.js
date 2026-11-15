@@ -72,13 +72,26 @@ describe("ECONNRESET during a WARP hop", () => {
       err.code = "ECONNRESET";
       throw err;
     };
-    // Hold the rotator busy while the request runs: a rotate whose command
-    // sleeps long enough. Windows `ping -n` / POSIX `sleep`.
-    const holdCmd = process.platform === "win32"
-      ? "ping -n 6 127.0.0.1 > nul"
-      : "sleep 5";
-    fs.writeFileSync(path.join(stateDir, "rotator.json"), JSON.stringify({ command: holdCmd, timeoutMs: 8000, cooldownMs: 1000 }));
+    // Hold the rotator busy deterministically: a rotate whose probe never
+    // resolves until we release it. Real command execution is CI-flaky (a
+    // skip for any reason makes busy false and the test asserts the wrong
+    // branch), so the hold rides the probe seam instead.
+    let releaseProbe;
+    const gate = new Promise((resolve) => (releaseProbe = resolve));
+    rotator.__setProbeImpl(async () => {
+      await gate;
+      return { ip: "203.0.113.9", error: null };
+    });
+    // A configured command is required or rotate() skips with "disabled"
+    // before setting inFlight. The command never runs: the probe gate holds
+    // the rotation.
+    fs.writeFileSync(
+      path.join(stateDir, "rotator.json"),
+      JSON.stringify({ command: "true", timeoutMs: 8000, cooldownMs: 1000 })
+    );
     const hold = rotator.rotate({ egressUrl: null, trigger: "manual" });
+    // rotate() runs synchronously up to its first await, so inFlight is set
+    // (busy) the moment the call returns — no timing window to race.
     assert.equal(rotator.describe().busy, true, "hold rotation must occupy the single-flight");
 
     const res = await post();
@@ -87,7 +100,9 @@ describe("ECONNRESET during a WARP hop", () => {
     assert.match(res.body.error.message, /rotasi WARP|di-hop/i);
     assert.equal(res.body.error.code, 503);
 
+    releaseProbe();
     await hold;
+    rotator.__setProbeImpl(null);
     rotator.__reset({ keepConfig: true });
   });
 
