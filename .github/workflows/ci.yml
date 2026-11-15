@@ -12,7 +12,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          # The gate checks the TLS ClientHello; transport-baseline.json was
+          # captured on a 1.4.x runtime and the Dockerfile pins 1.4.3. A newer
+          # Bun may ship a different cipher list, so CI must test the runtime
+          # the bridge actually ships with, not "latest".
+          bun-version: 1.4.3
       - name: Unit tests (Bun)
         run: bun test test/*.test.js
       - name: Offline drills (Bun)
