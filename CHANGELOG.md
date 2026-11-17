@@ -12,7 +12,7 @@ Quota 429 recovery is now a bounded, staged loop instead of one immediate hop.
 - A hop waits for the WARP tunnel to report Connected/healthy and extends the
   request deadline before dialling, so the `ECONNRESET` seen during the ~10s
   tunnel gap is retried inside the loop instead of surfacing to the client.
-- `/health` → `egress.rotator.quotaRecovery` exposes the policy and counters.
+- `server.js` now defaults `DNS_RESULT_ORDER=ipv6first`, so inference dials opencode.ai over the rotating WARP IPv6 address instead of the pinned IPv4 one. `egress-proxy.js` keeps `ipv4first` for its own upstream path.
 
 
 

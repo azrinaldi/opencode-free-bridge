@@ -1,10 +1,9 @@
 #!/usr/bin/env bun
 const dns = require("dns");
-// `ipv6first` only exists from Node 22, and an unsupported order throws
-// ERR_INVALID_ARG_VALUE at module load — which kills the bridge before it
-// listens instead of merely changing a preference. Fall back in order.
+// Prefer AAAA so inference rides the rotating WARP IPv6 address. Bun supports
+// `ipv6first`; an unsupported value throws at module load, so fall back safely.
 const DNS_RESULT_ORDER = (() => {
-  const wanted = String(process.env.DNS_RESULT_ORDER || "ipv4first").trim().toLowerCase();
+  const wanted = String(process.env.DNS_RESULT_ORDER || "ipv6first").trim().toLowerCase();
   for (const order of [wanted, "ipv4first", "verbatim"]) {
     try {
       dns.setDefaultResultOrder(order);
