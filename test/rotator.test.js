@@ -36,7 +36,7 @@ describe("rotator", () => {
 
   beforeEach(() => {
     dir = freshStateDir();
-    for (const env of ["WARP_ROTATE_CMD", "WARP_ROTATE_TIMEOUT_MS", "WARP_ROTATE_COOLDOWN_MS", "WARP_ROTATE_PROBE_URL"]) {
+    for (const env of ["WARP_ROTATE_CMD", "WARP_ROTATE_TIMEOUT_MS", "WARP_ROTATE_COOLDOWN_MS", "WARP_ROTATE_PROBE_URL", "ROTATE_PROVIDER", "TOR_CONTROL_HOST", "TOR_CONTROL_PORT", "TOR_CONTROL_PASSWORD", "TOR_CONTROL_COOKIE"]) {
       delete process.env[env];
     }
     // Point the state dir at the throwaway BEFORE any __reset({keepConfig:
@@ -338,6 +338,86 @@ describe("rotator", () => {
       assert.equal(skippedEntry.ok, false);
       // Never leak the command through history entries.
       assert.equal(JSON.stringify(desc.history).includes("noop"), false);
+    });
+  });
+
+  it("defaults to warp provider for legacy command-only configs", async () => {
+    await withStateDir(dir, async () => {
+      writeConfig(dir, { command: "noop" });
+      const d = rotator.describe();
+      assert.equal(d.provider, "warp");
+      assert.equal(d.enabled, true);
+      assert.equal(d.commandConfigured, true);
+    });
+  });
+
+  it("reads provider from file and env overrides file", async () => {
+    await withStateDir(dir, async () => {
+      writeConfig(dir, { command: "noop", provider: "warp" });
+      assert.equal(rotator.describe().provider, "warp");
+      writeConfig(dir, { command: "noop", provider: "tor", controlPassword: "pw" });
+      assert.equal(rotator.describe().provider, "tor");
+      assert.equal(rotator.describe().controlConfigured, true);
+      process.env.ROTATE_PROVIDER = "warp";
+      try {
+        assert.equal(rotator.describe().provider, "warp");
+      } finally {
+        delete process.env.ROTATE_PROVIDER;
+      }
+    });
+  });
+
+  it("rejects an invalid provider via setConfig", async () => {
+    await withStateDir(dir, async () => {
+      const r = rotator.setConfig({ provider: "vpn" });
+      assert.equal(r.ok, false);
+      assert.match(r.error, /provider/);
+    });
+  });
+
+  it("locks Tor control fields when env overrides are present", async () => {
+    await withStateDir(dir, async () => {
+      process.env.TOR_CONTROL_PASSWORD = "envpw";
+      try {
+        const r = rotator.setConfig({ provider: "tor", controlPassword: "panel" });
+        assert.equal(r.ok, false);
+        assert.match(r.error, /TOR_CONTROL_PASSWORD/);
+      } finally {
+        delete process.env.TOR_CONTROL_PASSWORD;
+      }
+    });
+  });
+
+  it("rotates via Tor control with an injected control seam", async () => {
+    await withStateDir(dir, async () => {
+      writeConfig(dir, { provider: "tor", controlPassword: "pw", controlHost: "127.0.0.1", controlPort: 9051 });
+      let afterControl = false;
+      let controlCalls = 0;
+      const result = await rotator.rotate({
+        _probe: async () => ({ ip: afterControl ? "185.100.85.2" : "185.100.85.1", error: null }),
+        _run: async () => { throw new Error("command should not run"); },
+        _control: async () => {
+          controlCalls++;
+          afterControl = true;
+          return { ok: true, error: null, reply: "250 OK" };
+        },
+      });
+      assert.equal(result.ok, true);
+      assert.equal(result.fromIp, "185.100.85.1");
+      assert.equal(result.toIp, "185.100.85.2");
+      assert.equal(controlCalls, 1);
+    });
+  });
+
+  it("fails a Tor rotation when the control step fails", async () => {
+    await withStateDir(dir, async () => {
+      writeConfig(dir, { provider: "tor", controlPassword: "pw" });
+      const result = await rotator.rotate({
+        _probe: async () => ({ ip: "1.2.3.4", error: null }),
+        _control: async () => ({ ok: false, error: "auth rejected", reply: null }),
+      });
+      assert.equal(result.ok, false);
+      assert.match(result.error, /Tor/i);
     });
   });
 });

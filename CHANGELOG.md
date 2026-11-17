@@ -1,4 +1,44 @@
 # Changelog
+## [2.7.1] — 2026-11-17
+
+Quota 429 recovery is now a bounded, staged loop instead of one immediate hop.
+
+### Changed
+
+- On `FreeUsageLimitError` the bridge retries the same egress 3 times first
+  (`QUOTA_PLAIN_RETRIES`), then rotates at most 10 times (`QUOTA_MAX_ROTATIONS`)
+  before answering with an explicit `quota_recovery_exhausted` error. The old
+  cooldown and 3-hop circuit breaker no longer cut the sequence short.
+- A hop waits for the WARP tunnel to report Connected/healthy and extends the
+  request deadline before dialling, so the `ECONNRESET` seen during the ~10s
+  tunnel gap is retried inside the loop instead of surfacing to the client.
+- `/health` → `egress.rotator.quotaRecovery` exposes the policy and counters.
+
+
+
+The reactive rotator now supports two providers: the existing WARP hop command
+and a new Tor circuit renewal via the control port.
+
+### Added
+
+- `ROTATE_PROVIDER=tor` rotates circuits with `SIGNAL NEWNYM` over the Tor
+  control socket. Authenticate with `TOR_CONTROL_PASSWORD` or
+  `TOR_CONTROL_COOKIE` (cookie bytes hex-encoded); `TOR_CONTROL_HOST` and
+  `TOR_CONTROL_PORT` default to `127.0.0.1:9051`. All Tor control settings are
+  write-only and lock the panel when set via environment.
+- `tor-control.js`: zero-dependency Tor control client with an injectable
+  socket for deterministic tests.
+- Panel: provider selector, Tor control fields, and provider-aware status card.
+  `POST /api/rotator` accepts `provider`, `controlHost`, `controlPort`,
+  `controlPassword`, and `controlCookiePath`.
+- Compose example documents a Tor sidecar alternative alongside WARP.
+
+### Notes
+
+- Tor still needs an HTTP proxy in front of its SOCKS port for Bun's fetch.
+  A new circuit may reuse the same exit IP; rotation success requires an
+  observed IP change, same as WARP.
+
 ## [2.6.0] — 2026-11-15
 
 The reactive WARP rotator learns when hops stop paying: live evidence showed a

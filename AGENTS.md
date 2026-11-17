@@ -121,15 +121,18 @@ candidate and reports the exit IP; *Matikan proxy* returns to direct egress. No 
   the bind address, or listed in `PANEL_ALLOWED_HOSTS`. Keep those checks if you touch the route.
 - `/health` → `egress.mode` (`proxy` / `relay` / `direct`) and `egress.proxy` (host:port only).
 
-### Reactive egress rotation (WARP hop on 429)
+### Reactive egress rotation (WARP / Tor hop on 429)
 
-When upstream answers `429 FreeUsageLimitError` and the operator configures a rotate command, the
+When upstream answers `429 FreeUsageLimitError` and the operator configures a rotation provider, the
 bridge can exchange a spent IP for a fresh one instead of passing the refusal to the client:
 
-- Configure once: panel section *Rotator egress (WARP hop)*, `POST /api/rotator
-  {"command":"…"}`, or env `WARP_ROTATE_CMD` (env locks the panel, like `UPSTREAM_PROXY_URL`).
-  The command is anything that produces a new egress address — `warp-cli disconnect && warp-cli
-  connect`, the OpenCode Unlimited *hop* CLI, a PowerShell script.
+- Configure once: panel section *Rotator egress (WARP / Tor)*, `POST /api/rotator
+  {"command":"…"}` for WARP, or `{"provider":"tor","controlPassword":"…"}` for Tor. Env overrides
+  (`WARP_ROTATE_CMD`, `ROTATE_PROVIDER`, `TOR_CONTROL_*`) lock the panel, like `UPSTREAM_PROXY_URL`.
+  WARP uses any command that produces a new egress address (`warp-cli disconnect && warp-cli
+  connect`, a hop CLI, a PowerShell script). Tor sends `SIGNAL NEWNYM` over the control port
+  (default `127.0.0.1:9051`) with password or cookie auth; an HTTP proxy in front of Tor remains
+  the bridge's egress because Bun's fetch refuses `socks5://`.
 - Flow on a quota 429 (`FreeUsageLimitError`; a model-capacity `RateLimitError`
   429 passes through untouched): run the command once → poll the exit IP (`WARP_ROTATE_PROBE_URL`,
   default `https://www.cloudflare.com/cdn-cgi/trace`; through the same egress the requests use —
@@ -245,6 +248,7 @@ When a user reports an error, diagnose it using this decision table before chang
 | `egress-proxy.js` | Dependency-free HTTP proxy for turning a host into a pool member: CONNECT plus absolute-URI HTTP, optional `EGRESS_PROXY_TOKEN` (Basic, password only), unauthenticated `/healthz`. Binds loopback by default; reachability is the tunnel's job. Pins `dns.setDefaultResultOrder(DNS_RESULT_ORDER \|\| "ipv4first")`: it dials the upstream itself for every CONNECT, and the gateway refuses IPv6 egress, so on a dual-stack host Bun's default `verbatim` order would tunnel every request out over the refused family. |
 | `panel.js` | The HTML panel served at `/`: same-origin form that reads and writes `/api/proxy`, shows live status without credentials, and escapes every config value. A live-summary row of four status cards (gate, egress IP, free models, rotator) polls `/health` every 15 s; a "Log bridge" tab draws the server's in-memory log ring buffer via `/api/logs` with auto-refresh and Copy; rotation history and per-egress usage tables follow the same real-values-only rule. |
 | `rotator.js` | Reactive egress rotation (WARP hop): on a quota 429 the bridge runs the operator's `WARP_ROTATE_CMD` (or the panel-configured command in `<state dir>/rotator.json`, mode `0600`; env locks the panel like `UPSTREAM_PROXY_URL`), probes the exit IP through the same egress the requests use (`cdn-cgi/trace` via `proxy.netFetch`; direct only when no egress is configured — the TUN-mode case) until it differs from the pre-rotation address or `WARP_ROTATE_TIMEOUT_MS` (default 45s) elapses, then clears the egress cooldown and retries the request once — the client never sees the 429 when the hop succeeds. Single-flight, inter-rotation cooldown (`WARP_ROTATE_COOLDOWN_MS`, default 75s), and a 20/hour cap; skipped entirely when a ≥2-entry pool is active (the pool walk owns failover) and for 403/ip-abuse (a hop cannot fix a shape problem and only prolongs an abuse penalty). Every attempt — success, command failure, and skip (disabled/cooling/busy/capped) — is recorded in an in-memory history (last 50, surfaced as `history` in `GET /api/rotator` and drawn in the panel) with its trigger (`manual` vs `429`); the command string never appears in history entries. Status: `GET /health` → `egress.rotator`; config/trigger: `GET/POST /api/rotator` (same `adminRequestError` guard as `/api/proxy`, command string is write-only). |
+| `tor-control.js` | Minimal Tor control protocol client: connects to the control socket, authenticates with `AUTHENTICATE "password"` or a hex-encoded cookie, sends `SIGNAL NEWNYM` to renew a circuit, and reads the `250` reply. Used by `rotator.js` when `ROTATE_PROVIDER=tor`. Zero dependencies, injectable `connect` for tests. |
 | `transport-fingerprint.js` | Captures the runtime's raw TLS `ClientHello` bytes against a local TCP listener and compares cipher suites and extension order against `transport-baseline.json`. |
 | `gate-drill.js` | End-to-end self-healing drill suite (4 live drills + 6 deterministic offline drills including `full-corrupt`). |
 | `verify.js` | Live model readiness checker (`bun verify.js` / `bun verify.js --quick`); sends `stream: true` and halts immediately on `gate-closed` (`403` with `X-OpenCode-Gate: ip-throttled` or `ip-abuse`, or the free-tier/abuse message) **and on the first `429` allowance** — both mean the sweep must stop so the IP cooldown is not extended. |

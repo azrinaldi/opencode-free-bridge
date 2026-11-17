@@ -97,7 +97,36 @@ services:
       retries: 5
       start_period: 40s
 
+  # Tor alternative: replace the WARP service above with this one, set the
+  # bridge egress to http://tor-proxy:8118, and configure the rotator provider
+  # as "tor" in the panel (or ROTATE_PROVIDER=tor). The Tor container exposes
+  # SOCKS on 9050; Privoxy translates it to HTTP on 8118 for Bun's fetch.
+  # tor-control.js sends SIGNAL NEWNYM to 127.0.0.1:9051 inside this container,
+  # so set TOR_CONTROL_HOST=tor (the service name) in the bridge environment.
+  #
+  # tor:
+  #   image: ghcr.io/luqman-v1/tor-sidecar:latest
+  #   container_name: tor
+  #   restart: unless-stopped
+  #   environment:
+  #     TOR_CONTROL_PASSWORD: "change-me"
+  #   volumes:
+  #     - tor-state:/var/lib/tor
+  #   healthcheck:
+  #     test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8118/"]
+  #     interval: 30s
+  #     timeout: 10s
+  #     retries: 5
+  #
+  # For a local Tor daemon on the host (not in Docker), leave the bridge's
+  # egress as an HTTP proxy fronting Tor and set these on the bridge service:
+  #   ROTATE_PROVIDER: "tor"
+  #   TOR_CONTROL_HOST: "host.docker.internal"
+  #   TOR_CONTROL_PORT: "9051"
+  #   TOR_CONTROL_PASSWORD: "your-password"   # or TOR_CONTROL_COOKIE: "/path/to/control_auth_cookie"
+
 volumes:
   bridge-cache:
   bridge-state:
   warp-state:
+  # tor-state:

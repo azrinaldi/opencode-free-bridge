@@ -31,8 +31,14 @@
  *   WARP_ROTATE_TIMEOUT_MS  whole-rotation deadline (default 45000)
  *   WARP_ROTATE_COOLDOWN_MS min gap between rotations (default 75000)
  *   WARP_ROTATE_PROBE_URL   ip-echo endpoint (default cloudflare cdn-cgi/trace)
+ *   ROTATE_PROVIDER         "warp" (default) or "tor"; legacy command-only
+ *                           configs keep warp behavior
+ *   TOR_CONTROL_HOST        Tor control host (default 127.0.0.1)
+ *   TOR_CONTROL_PORT        Tor control port (default 9051)
+ *   TOR_CONTROL_PASSWORD    password for AUTHENTICATE (quoted in protocol)
+ *   TOR_CONTROL_COOKIE      path to Tor's cookie auth file (hex sent)
  *
- * Disabled by default: an absent command means rotate() is a no-op that
+ * Disabled by default: no command and no Tor control config means rotate()
  * reports `enabled: false`, and the server falls through to the plain 429.
  */
 
@@ -47,9 +53,17 @@ const ENV_CMD = "WARP_ROTATE_CMD";
 const ENV_TIMEOUT = "WARP_ROTATE_TIMEOUT_MS";
 const ENV_COOLDOWN = "WARP_ROTATE_COOLDOWN_MS";
 const ENV_PROBE_URL = "WARP_ROTATE_PROBE_URL";
+const ENV_PROVIDER = "ROTATE_PROVIDER";
+const ENV_TOR_HOST = "TOR_CONTROL_HOST";
+const ENV_TOR_PORT = "TOR_CONTROL_PORT";
+const ENV_TOR_PASSWORD = "TOR_CONTROL_PASSWORD";
+const ENV_TOR_COOKIE = "TOR_CONTROL_COOKIE";
+
+const PROVIDERS = new Set(["warp", "tor"]);
 
 const DEFAULT_TIMEOUT_MS = 45_000;
 const DEFAULT_COOLDOWN_MS = 75_000;
+
 const DEFAULT_PROBE_URL = "https://www.cloudflare.com/cdn-cgi/trace";
 const PROBE_INTERVAL_MS = 2_000;
 const PROBE_TIMEOUT_MS = 8_000;
@@ -101,9 +115,39 @@ function readEffective() {
   const file = readConfigObject();
   const envCmd = String(process.env[ENV_CMD] ?? "").trim();
   const cmd = envCmd || String(file.command ?? "").trim();
+  const envProvider = String(process.env[ENV_PROVIDER] ?? "").trim().toLowerCase();
+  const fileProvider = String(file.provider ?? "").trim().toLowerCase();
+  const provider = PROVIDERS.has(envProvider)
+    ? envProvider
+    : PROVIDERS.has(fileProvider)
+      ? fileProvider
+      : "warp";
+  const torHost = String(process.env[ENV_TOR_HOST] ?? "").trim() ||
+    String(file.controlHost ?? "").trim() || "127.0.0.1";
+  const envPort = parseInt(process.env[ENV_TOR_PORT] ?? "", 10);
+  const filePort = parseInt(file.controlPort, 10);
+  const controlPort = Number.isFinite(envPort) && envPort >= 1 && envPort <= 65535
+    ? envPort
+    : Number.isFinite(filePort) && filePort >= 1 && filePort <= 65535
+      ? filePort
+      : 9051;
+  const controlPassword = String(process.env[ENV_TOR_PASSWORD] ?? "").trim() ||
+    String(file.controlPassword ?? "");
+  const controlCookiePath = String(process.env[ENV_TOR_COOKIE] ?? "").trim() ||
+    String(file.controlCookiePath ?? "").trim();
+  const torConfigured = provider === "tor" && Boolean(controlPassword || controlCookiePath);
   return {
+    provider,
     command: cmd,
     locked: Boolean(envCmd),
+    torLocked: Boolean(process.env[ENV_TOR_HOST] || process.env[ENV_TOR_PORT] ||
+      process.env[ENV_TOR_PASSWORD] || process.env[ENV_TOR_COOKIE]),
+    torHost,
+    controlPort,
+    controlPassword,
+    controlCookiePath,
+    torConfigured,
+    enabled: provider === "warp" ? Boolean(cmd) : Boolean(cmd || torConfigured),
     timeoutMs: envInt(ENV_TIMEOUT, Number(file.timeoutMs) > 0 ? Number(file.timeoutMs) : DEFAULT_TIMEOUT_MS),
     cooldownMs: envInt(
       ENV_COOLDOWN,
@@ -138,9 +182,13 @@ function describe() {
   const cfg = readEffective();
   const now = Date.now();
   return {
-    enabled: Boolean(cfg.command),
-    locked: cfg.locked,
+    provider: cfg.provider,
+    enabled: cfg.enabled,
+    locked: cfg.locked || (cfg.provider === "tor" && cfg.torLocked),
     commandConfigured: Boolean(cfg.command),
+    controlConfigured: cfg.torConfigured,
+    controlHost: cfg.torHost,
+    controlPort: cfg.controlPort,
     timeoutMs: cfg.timeoutMs,
     cooldownMs: cfg.cooldownMs,
     coolingUntil: coolingUntil > now ? coolingUntil : 0,
@@ -236,7 +284,7 @@ let probeIntervalMs = PROBE_INTERVAL_MS;
 const HISTORY_LIMIT = 50;
 let history = []; // newest last; { at, ok, changed, fromIp, toIp, skipped, error, durationMs, trigger }
 
-async function rotate({ now = Date.now(), _probe = null, _run = runCommand, egressUrl = null, trigger = "manual", ignoreCooldown = false } = {}) {
+async function rotate({ now = Date.now(), _probe = null, _run = runCommand, _control = null, egressUrl = null, trigger = "manual", ignoreCooldown = false } = {}) {
   const cfg = readEffective();
   const probe = _probe || probeExitIpImpl || probeExitIp;
   const started = now;
@@ -258,7 +306,7 @@ async function rotate({ now = Date.now(), _probe = null, _run = runCommand, egre
     return entry;
   };
 
-  if (!cfg.command) return skip("disabled", "Perintah rotasi belum diatur.");
+  if (!cfg.enabled) return skip("disabled", cfg.provider === "tor" ? "Perintah rotasi atau konfigurasi kontrol Tor belum diatur." : "Perintah rotasi belum diatur.");
   if (inFlight) return skip("busy", "Rotasi lain sedang berjalan.");
   // ignoreCooldown is the caller vouching that the wait protects nothing: the
   // reactive hook passes it when the previous hop's fresh address was already
@@ -276,19 +324,61 @@ async function rotate({ now = Date.now(), _probe = null, _run = runCommand, egre
     const before = await probe(cfg.probeUrl, PROBE_TIMEOUT_MS, egressUrl);
     const fromIp = before.ip;
 
-    const run = await _run(cfg.command, cfg.timeoutMs);
-    if (!run.ok) {
-      return {
-        ok: false,
-        changed: false,
-        fromIp,
-        toIp: null,
-        skipped: null,
-        error: `Perintah rotasi gagal: ${run.error}`,
-        output: run.output,
-        stderr: run.stderr,
-        durationMs: Date.now() - started,
-      };
+    let run = { ok: true, error: null, output: null, stderr: null };
+    if (cfg.command) {
+      run = await _run(cfg.command, cfg.timeoutMs);
+      if (!run.ok) {
+        return {
+          ok: false,
+          changed: false,
+          fromIp,
+          toIp: null,
+          skipped: null,
+          error: `Perintah rotasi gagal: ${run.error}`,
+          output: run.output,
+          stderr: run.stderr,
+          durationMs: Date.now() - started,
+        };
+      }
+    }
+
+    if (cfg.provider === "tor" && cfg.torConfigured) {
+      let controlFn = _control;
+      if (!controlFn) {
+        try {
+          controlFn = require("./tor-control").newnym;
+        } catch (err) {
+          return {
+            ok: false,
+            changed: false,
+            fromIp,
+            toIp: null,
+            skipped: null,
+            error: `Modul tor-control.js belum terpasang. Jalankan ulang install.sh: ${err.message}`,
+            durationMs: Date.now() - started,
+          };
+        }
+      }
+      const control = await controlFn({
+        host: cfg.torHost,
+        port: cfg.controlPort,
+        password: cfg.controlPassword || null,
+        cookiePath: cfg.controlCookiePath || null,
+        timeoutMs: Math.min(cfg.timeoutMs, 10_000),
+      });
+      if (!control.ok) {
+        return {
+          ok: false,
+          changed: false,
+          fromIp,
+          toIp: null,
+          skipped: null,
+          error: `Rotasi sirkuit Tor gagal: ${control.error}`,
+          output: run.output,
+          stderr: run.stderr,
+          durationMs: Date.now() - started,
+        };
+      }
     }
 
     // Poll until the exit IP differs. Some rotators finish before the tunnel
@@ -367,15 +457,52 @@ async function rotate({ now = Date.now(), _probe = null, _run = runCommand, egre
 }
 
 /** Write config from the panel. Empty command clears it (disable). */
-function setConfig({ command, timeoutMs, cooldownMs, probeUrl } = {}) {
+function setConfig({ command, timeoutMs, cooldownMs, probeUrl, provider, controlHost, controlPort, controlPassword, controlCookiePath } = {}) {
   if (process.env[ENV_CMD] && process.env[ENV_CMD].trim()) {
     return { ok: false, error: `Rotator dikunci oleh ${ENV_CMD}; ubah environment service untuk mengganti perintah.` };
   }
+  const envTorFields = [ENV_TOR_HOST, ENV_TOR_PORT, ENV_TOR_PASSWORD, ENV_TOR_COOKIE].filter(
+    (name) => process.env[name] && String(process.env[name]).trim()
+  );
+  if (envTorFields.length && (controlHost !== undefined || controlPort !== undefined ||
+      controlPassword !== undefined || controlCookiePath !== undefined)) {
+    return { ok: false, error: `Konfigurasi kontrol Tor dikunci oleh ${envTorFields.join(", ")}; ubah environment service.` };
+  }
+  if (process.env[ENV_PROVIDER] && String(process.env[ENV_PROVIDER]).trim()) {
+    return { ok: false, error: `Provider dikunci oleh ${ENV_PROVIDER}; ubah environment service.` };
+  }
   const config = readConfigObject();
+  if (provider !== undefined) {
+    const p = String(provider ?? "").trim().toLowerCase();
+    if (!PROVIDERS.has(p)) return { ok: false, error: "provider harus 'warp' atau 'tor'." };
+    config.provider = p;
+  }
   if (command !== undefined) {
     const cmd = String(command ?? "").trim();
     if (cmd) config.command = cmd;
     else delete config.command;
+  }
+  if (controlHost !== undefined) {
+    const h = String(controlHost ?? "").trim();
+    if (h) config.controlHost = h;
+    else delete config.controlHost;
+  }
+  if (controlPort !== undefined) {
+    const port = Number(controlPort);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      return { ok: false, error: "controlPort harus 1–65535." };
+    }
+    config.controlPort = port;
+  }
+  if (controlPassword !== undefined) {
+    const pw = String(controlPassword ?? "");
+    if (pw) config.controlPassword = pw;
+    else delete config.controlPassword;
+  }
+  if (controlCookiePath !== undefined) {
+    const cp = String(controlCookiePath ?? "").trim();
+    if (cp) config.controlCookiePath = cp;
+    else delete config.controlCookiePath;
   }
   if (timeoutMs !== undefined) {
     const n = Number(timeoutMs);
@@ -431,6 +558,7 @@ function __reset({ keepConfig = true } = {}) {
 module.exports = {
   CONFIG_FILE_NAME,
   ENV_CMD,
+  ENV_PROVIDER,
   describe,
   rotate,
   probeExitIp,

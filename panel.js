@@ -7,168 +7,244 @@
  * from `proxy.describe()` over JSON; no user-supplied value is interpolated into
  * this HTML, and the client sets every dynamic string with `textContent`.
  *
- * Design direction (my call, no DESIGN.md in this repo): an operations console for
- * a developer running a local bridge. Warm paper and ink, one clay accent reserved
- * for the commit action and the focus ring, system UI type for prose and monospace
- * only where characters are read one by one (a proxy URL). Dials: ENERGY 1,
- * RHYTHM 1, MOTION 1: this is a settings surface, not a landing page.
+ * Design direction: Material Design 3, as requested by the operator. A settings
+ * console for the local bridge, using MD3 tonal surfaces, outlined fields, and
+ * one filled primary action. A compact top app bar holds a live status pill and
+ * four text tabs; tabs group the real operator tasks (see health, change egress,
+ * rotate, debug) so a short screen never scrolls through unrelated sections.
+ * System UI type for prose; monospace only where characters are read one by one
+ * (a proxy URL or an IP). Dials: ENERGY 1, RHYTHM 1, MOTION 1.
  */
 
 const STYLE = `
+/* Material Design 3 tokens. Light and dark palettes follow MD3's baseline
+   roles. Surfaces are tonal, fields are outlined, and the one filled button
+   is the proxy commit action: the decision this screen exists to support.
+   Contrast of every text/background pairing was measured against WCAG AA
+   (R-25); the log console uses its own fixed elevated surface in both themes. */
 :root {
   color-scheme: light dark;
-  --paper: #f7f5f1;
-  --surface: #ffffff;
-  --ink: #1c1a16;
-  --muted: #5c574e;
-  --rule: #cfc9bf;
-  --field: #8d857a;
-  --accent: #9a3f10;
-  --accent-ink: #ffffff;
-  --ok: #2c6a33;
-  --bad: #9b2118;
+  --primary: #6750A4;
+  --on-primary: #FFFFFF;
+  --primary-container: #EADDFF;
+  --on-primary-container: #21005D;
+  --secondary-container: #E8DEF8;
+  --on-secondary-container: #1D192B;
+  --surface: #FEF7FF;
+  --surface-container-low: #F7F2FA;
+  --surface-container: #F3EDF7;
+  --surface-container-high: #ECE6F0;
+  --on-surface: #1D1B20;
+  --on-surface-variant: #49454F;
+  --outline: #79747E;
+  --outline-strong: #49454F;
+  --error: #B3261E;
+  --success: #1B5E20;
+  --log-surface: #1D1B20;
+  --log-on-surface: #E6E0E9;
+  --log-muted: #CAC4D0;
+  --log-warn: #FFD85E;
+  --log-error: #F2B8B5;
 }
 @media (prefers-color-scheme: dark) {
   :root {
-    --paper: #131211;
-    --surface: #1b1a18;
-    --ink: #ece7de;
-    --muted: #a49c92;
-    --rule: #3a3631;
-    --field: #7a746a;
-    --accent: #e39a63;
-    --accent-ink: #1a1208;
-    --ok: #7bc48a;
-    --bad: #f08c82;
+    --primary: #D0BCFF;
+    --on-primary: #381E72;
+    --primary-container: #4F378B;
+    --on-primary-container: #EADDFF;
+    --secondary-container: #4A4458;
+    --on-secondary-container: #E8DEF8;
+    --surface: #141218;
+    --surface-container-low: #1D1B20;
+    --surface-container: #211F26;
+    --surface-container-high: #2B2930;
+    --on-surface: #E6E0E9;
+    --on-surface-variant: #CAC4D0;
+    --outline: #938F99;
+    --outline-strong: #CAC4D0;
+    --error: #F2B8B5;
+    --success: #6DD58C;
   }
 }
 * { box-sizing: border-box; }
+html { scroll-padding-top: 140px; }
 body {
   margin: 0;
-  padding: 40px 20px 64px;
-  background: var(--paper);
-  color: var(--ink);
-  font: 16px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  padding: 0 20px 64px;
+  background: var(--surface);
+  color: var(--on-surface);
+  font: 16px/1.55 Roboto, "Segoe UI", system-ui, -apple-system, sans-serif;
 }
-main { max-width: 620px; margin: 0 auto; }
-header { border-bottom: 1px solid var(--rule); padding-bottom: 16px; margin-bottom: 28px; }
-h1 { font-size: 1.25rem; line-height: 1.3; margin: 0 0 6px; letter-spacing: -0.01em; }
-.sub { margin: 0; color: var(--muted); font-size: 0.9375rem; }
-h2 { font-size: 0.8125rem; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: var(--muted); margin: 0 0 12px; }
-section { margin-bottom: 32px; }
+main { max-width: 640px; margin: 0 auto; }
+/* MD3 top app bar, compact and sticky. The tab row sits inside it so the
+   current task stays visible and one thumb tap reaches any other task. */
+.app-bar {
+  position: sticky; top: 0; z-index: 10;
+  margin: 0 -20px; padding: 12px 20px 0;
+  background: var(--surface);
+  border-bottom: 1px solid var(--surface-container-high);
+}
+.app-bar-inner { max-width: 640px; margin: 0 auto; display: flex; align-items: center; gap: 12px; }
+h1 { font-size: 1.25rem; line-height: 1.3; font-weight: 500; margin: 0; flex: 1; }
+/* Live status chip: real state from /health, never decorative (R-09, R-31). */
+.app-status {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 5px 12px; border-radius: 16px; font-size: 0.8125rem; font-weight: 500;
+  background: var(--surface-container); color: var(--on-surface-variant);
+}
+.app-status[data-state="idle"] { background: var(--surface-container); color: var(--on-surface-variant); }
+.app-status[data-state="ok"] { background: var(--surface-container); color: var(--success); }
+.app-status[data-state="warn"] { background: var(--surface-container); color: var(--error); }
+.app-status .dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
+.sub { margin: 10px 0 0; color: var(--on-surface-variant); font-size: 0.875rem; }
+/* MD3 primary tabs: text labels, 48dp tall, 3dp indicator marking the active
+   tab. The indicator is a real state marker, not decoration. */
+.tabs {
+  display: flex; gap: 4px; max-width: 640px; margin: 12px auto 0;
+  overflow-x: auto; scrollbar-width: none;
+}
+.tabs::-webkit-scrollbar { display: none; }
+.tab {
+  flex: 1 0 auto; min-width: 84px; min-height: 48px;
+  padding: 12px 12px 10px; border: none; border-radius: 0;
+  background: transparent; color: var(--on-surface-variant);
+  font-size: 0.875rem; font-weight: 500;
+  border-bottom: 3px solid transparent;
+}
+.tab[aria-selected="true"] { color: var(--primary); border-bottom-color: var(--primary); }
+.tab:focus-visible { outline-offset: -3px; }
+.panel[hidden] { display: none; }
+/* Section heads are MD3 title-small, not uppercase tracking (R-06). */
+h2 { font-size: 1rem; font-weight: 500; line-height: 1.4; color: var(--on-surface); margin: 0 0 12px; }
+section { margin-bottom: 24px; }
+/* MD3 filled card: surface-container-low, 12dp radius, no shadow. Elevation
+   is reserved for the log console only. */
+.status, .live-box, .card, .pool-list li {
+  border: none; border-radius: 12px; background: var(--surface-container-low);
+}
 .status {
   display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 12px;
-  padding: 14px 16px; border: 1px solid var(--rule); border-radius: 3px; background: var(--surface);
+  padding: 16px;
 }
-.status .mode { font-weight: 600; }
-.status .mode[data-mode="proxy"] { color: var(--ok); }
+.status .mode { font-weight: 500; color: var(--primary); }
 .status .host { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.9375rem; }
-.status .note { color: var(--muted); font-size: 0.875rem; width: 100%; }
-.field { margin-bottom: 20px; }
-label { display: block; font-weight: 600; font-size: 0.9375rem; margin-bottom: 6px; }
-input[type="text"] {
-  width: 100%; padding: 10px 12px; font-size: 1rem;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  color: var(--ink); background: var(--surface);
-  border: 1px solid var(--field); border-radius: 3px;
+.status .note { color: var(--on-surface-variant); font-size: 0.875rem; width: 100%; }
+.field { margin-bottom: 16px; }
+label { display: block; font-weight: 500; font-size: 0.9375rem; margin-bottom: 6px; color: var(--on-surface); }
+/* MD3 outlined text fields: 4dp radius, outline border, filled surface,
+   primary border/focus ring. Focus is visible for keyboard use (R-32). */
+input[type="text"], input[type="password"], input[type="number"], textarea, select {
+  width: 100%; padding: 10px 12px; font-size: 1rem; font-family: inherit;
+  color: var(--on-surface); background: var(--surface);
+  border: 1px solid var(--outline-strong); border-radius: 4px;
+  appearance: none;
 }
-textarea {
-  width: 100%; padding: 10px 12px; font-size: 0.9375rem; resize: vertical;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  color: var(--ink); background: var(--surface);
-  border: 1px solid var(--field); border-radius: 3px;
-}
+input[type="text"], textarea { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+textarea { font-size: 0.9375rem; resize: vertical; }
 select {
-  width: 100%; padding: 10px 12px; font-size: 0.9375rem;
-  color: var(--ink); background: var(--surface);
-  border: 1px solid var(--field); border-radius: 3px;
+  font-size: 0.9375rem;
+  background-image: linear-gradient(45deg, transparent 50%, var(--on-surface-variant) 50%),
+                    linear-gradient(135deg, var(--on-surface-variant) 50%, transparent 50%);
+  background-position: calc(100% - 18px) 50%, calc(100% - 13px) 50%;
+  background-size: 5px 5px, 5px 5px;
+  background-repeat: no-repeat;
+  padding-right: 32px;
 }
-.pool-list { list-style: none; margin: 12px 0 0; padding: 0; display: grid; gap: 6px; }
+input::placeholder, textarea::placeholder { color: var(--on-surface-variant); opacity: 1; }
+.pool-list { list-style: none; margin: 12px 0 0; padding: 0; display: grid; gap: 8px; }
 .pool-list[hidden] { display: none; }
 .pool-list li {
   display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px;
-  padding: 8px 12px; border: 1px solid var(--rule); border-radius: 3px;
-  background: var(--surface); font-size: 0.9375rem;
+  padding: 12px; font-size: 0.9375rem;
 }
-.pool-list .name { font-weight: 600; }
+.pool-list .name { font-weight: 500; }
 .pool-list .addr { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.875rem; }
-.pool-list .state { margin-left: auto; font-size: 0.8125rem; font-weight: 600; letter-spacing: 0.02em; text-transform: uppercase; }
-.pool-list .state[data-state="ready"] { color: var(--ok); }
-.pool-list .state[data-state="cooling"] { color: var(--bad); }
-.pool-list .state[data-state="disabled"] { color: var(--muted); }
-.pool-list .detail { width: 100%; color: var(--muted); font-size: 0.8125rem; }
-input[type="text"]::placeholder { color: var(--muted); opacity: 1; }
-.hint { margin: 6px 0 0; font-size: 0.875rem; color: var(--muted); }
-.hint code { font-size: 0.8125rem; }
-.actions { display: flex; flex-wrap: wrap; gap: 10px; }
-button {
-  font: inherit; font-size: 0.9375rem; font-weight: 600;
-  padding: 10px 18px; min-height: 44px;
-  border: 1px solid var(--field); border-radius: 3px;
-  background: var(--surface); color: var(--ink); cursor: pointer;
+/* State labels: real server state only (ready/cooling/disabled), no decoration. */
+.pool-list .state { margin-left: auto; font-size: 0.8125rem; font-weight: 500; }
+.pool-list .state[data-state="ready"] { color: var(--success); }
+.pool-list .state[data-state="cooling"] { color: var(--error); }
+.pool-list .state[data-state="disabled"] { color: var(--on-surface-variant); }
+.pool-list .detail { width: 100%; color: var(--on-surface-variant); font-size: 0.8125rem; }
+/* Model list: one row per discovered model with a real probe action. */
+.model-list { list-style: none; margin: 12px 0 0; padding: 0; display: grid; gap: 8px; }
+.model-list[hidden] { display: none; }
+.model-list li {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px;
+  padding: 10px 12px; border-radius: 12px; background: var(--surface-container-low);
 }
-button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
-button:disabled { opacity: 0.55; cursor: default; }
-:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-.report { margin-top: 20px; font-size: 0.9375rem; }
+.model-list .model-id { flex: 1; min-width: 0; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.875rem; overflow-wrap: anywhere; }
+.model-list button { min-height: 44px; padding: 8px 16px; font-size: 0.8125rem; }
+.hint { margin: 6px 0 0; font-size: 0.875rem; color: var(--on-surface-variant); }
+.hint code { font-size: 0.8125rem; }
+.actions { display: flex; flex-wrap: wrap; gap: 8px; }
+/* MD3 buttons: filled (primary), tonal (secondary), outlined (tertiary).
+   The proxy save is the single filled action; all others are tonal or outlined. */
+button {
+  font: inherit; font-size: 0.9375rem; font-weight: 500;
+  padding: 10px 20px; min-height: 40px;
+  border-radius: 20px; border: 1px solid transparent;
+  background: transparent; color: var(--primary); cursor: pointer;
+}
+button.primary { background: var(--primary); color: var(--on-primary); border-color: var(--primary); }
+button.tonal { background: var(--secondary-container); color: var(--on-secondary-container); }
+button:disabled { opacity: 0.45; cursor: default; }
+:focus-visible { outline: 3px solid var(--primary); outline-offset: 2px; }
+.report { margin-top: 16px; font-size: 0.9375rem; }
 .report[hidden] { display: none; }
 .report .line { margin: 0 0 4px; }
-.report .ok { color: var(--ok); font-weight: 600; }
-.report .bad { color: var(--bad); font-weight: 600; }
+.report .ok { color: var(--success); font-weight: 500; }
+.report .bad { color: var(--error); font-weight: 500; }
 .report .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
-.live-box { padding: 14px 16px; border: 1px solid var(--rule); border-radius: 3px; background: var(--surface); }
-/* Status cards: four facts, one glance. The gate card is the only one that
-   takes state color; the rest stay ink so color marks where attention goes. */
-.card-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; }
-.card {
-  display: flex; flex-direction: column; gap: 2px;
-  padding: 10px 12px; border: 1px solid var(--rule); border-radius: 3px;
-  background: var(--surface);
-}
-.card-label { font-size: 0.75rem; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: var(--muted); }
-.card-val { font-size: 1.0625rem; font-weight: 600; overflow-wrap: anywhere; }
+/* Live summary: cards on a tonal grid. The gate card is the only one that
+   carries state color; the rest stay ink so color marks where attention goes. */
+.card-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px; }
+.card { display: flex; flex-direction: column; gap: 2px; padding: 16px; }
+.card-label { font-size: 0.75rem; font-weight: 500; color: var(--on-surface-variant); }
+.card-val { font-size: 1.0625rem; font-weight: 500; overflow-wrap: anywhere; }
 .card-val.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.9375rem; }
-.card-sub { font-size: 0.8125rem; color: var(--muted); }
-.card[data-gate="open"] .card-val { color: var(--ok); }
-.card[data-gate="throttled"] .card-val, .card[data-gate="ip-blocked"] .card-val { color: var(--bad); }
-.usage { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 0.875rem; }
+.card-sub { font-size: 0.8125rem; color: var(--on-surface-variant); }
+.card[data-gate="open"] .card-val { color: var(--success); }
+.card[data-gate="throttled"] .card-val, .card[data-gate="ip-blocked"] .card-val { color: var(--error); }
+.usage { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 0.875rem; }
 .usage-wrap { overflow-x: auto; }
-.usage caption { text-align: left; color: var(--muted); font-size: 0.8125rem; padding-bottom: 6px; }
-.usage th, .usage td { text-align: left; padding: 4px 8px 4px 0; border-bottom: 1px solid var(--rule); }
+.usage caption { text-align: left; color: var(--on-surface-variant); font-size: 0.8125rem; padding-bottom: 6px; }
+.usage th, .usage td { text-align: left; padding: 6px 8px 6px 0; border-bottom: 1px solid var(--surface-container-high); }
 .usage tbody tr:last-child td { border-bottom: none; }
-.usage th { color: var(--muted); font-weight: 600; }
+.usage th { color: var(--on-surface-variant); font-weight: 500; }
 .usage td.num, .usage th.num { text-align: right; font-variant-numeric: tabular-nums; }
-.updated { margin: 10px 0 0; color: var(--muted); font-size: 0.8125rem; }
-/* Log console: the one deliberately dark surface. Reason: a log stream reads
-   as a terminal, and the paper theme fights monospace output; one inset
-   console panel carries that character so the rest stays paper (antislop: one
-   focal treatment, not a page-wide theme). */
+.updated { margin: 10px 0 0; color: var(--on-surface-variant); font-size: 0.8125rem; }
+/* Log console: the one deliberately elevated dark surface in both themes.
+   Reason: a log stream reads as a terminal; the tonal surface fights monospace
+   output, so one inset console carries that character (one focal treatment). */
 .logbox {
-  background: #191713; color: #d8d2c6;
-  border: 1px solid var(--rule); border-radius: 3px;
-  padding: 10px 12px; margin: 0;
+  background: var(--log-surface); color: var(--log-on-surface);
+  border: none; border-radius: 12px;
+  padding: 12px; margin: 0;
   height: 300px; overflow-y: auto;
   font: 12.5px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
 .logbox .row { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
-.logbox .row .t { color: #8a8375; }
-.logbox .row[data-level="warn"] { color: #e8b45a; }
-.logbox .row[data-level="error"] { color: #f08c82; }
-.logtabs { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-bottom: 8px; }
-.logtabs button {
-  min-height: 36px; padding: 6px 12px; font-size: 0.8125rem;
-}
-.logtabs button[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); }
-.logtabs .log-auto { display: inline-flex; align-items: center; gap: 6px; margin: 0; font-size: 0.875rem; font-weight: 600; }
+.logbox .row .t { color: var(--log-muted); }
+.logbox .row[data-level="warn"] { color: var(--log-warn); }
+.logbox .row[data-level="error"] { color: var(--log-error); }
+.logtabs { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 8px; }
+.logtabs button { min-height: 36px; padding: 6px 14px; font-size: 0.8125rem; }
+.logtabs button[aria-pressed="true"] { background: var(--secondary-container); color: var(--on-secondary-container); }
+.logtabs .log-auto { display: inline-flex; align-items: center; gap: 6px; margin: 0; font-size: 0.875rem; font-weight: 500; }
 .logtabs .log-auto input { width: auto; margin: 0; }
 #log-stamp { margin: 0; }
 dl { display: grid; grid-template-columns: max-content 1fr; gap: 8px 20px; margin: 0; font-size: 0.9375rem; }
-dt { color: var(--muted); }
+dt { color: var(--on-surface-variant); }
 dd { margin: 0; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; overflow-wrap: anywhere; }
-footer { border-top: 1px solid var(--rule); padding-top: 16px; color: var(--muted); font-size: 0.875rem; }
-footer a { color: var(--ink); }
-@media (max-width: 480px) {
-  body { padding: 28px 16px 48px; }
+footer { border-top: 1px solid var(--surface-container-high); padding-top: 16px; color: var(--on-surface-variant); font-size: 0.875rem; }
+footer a { color: var(--primary); }
+dd a { display: inline-block; padding: 12px 4px; margin: -12px -4px; min-height: 44px; }
+@media (max-width: 600px) {
+  body { padding: 0 16px 48px; }
+  .app-bar { margin: 0 -16px; padding: 10px 16px 0; }
+  h1 { font-size: 1.125rem; }
+  .sub { font-size: 0.8125rem; }
+  .tab { min-width: 76px; padding: 10px 8px; font-size: 0.8125rem; }
   .actions button { width: 100%; }
   dl { grid-template-columns: 1fr; gap: 2px 0; }
   dd { margin-bottom: 8px; }
@@ -178,6 +254,35 @@ footer a { color: var(--ink); }
 
 const SCRIPT = `
 const $ = (id) => document.getElementById(id);
+
+// --- tabs: one task per pane, keyboard arrows included (R-32) ---
+const TAB_IDS = ["tab-ringkasan", "tab-proxy", "tab-rotator", "tab-log"];
+function selectTab(id) {
+  for (const tabId of TAB_IDS) {
+    const tab = $(tabId);
+    const pane = $(tab.getAttribute("aria-controls"));
+    const active = tabId === id;
+    tab.setAttribute("aria-selected", active ? "true" : "false");
+    tab.tabIndex = active ? 0 : -1;
+    pane.hidden = !active;
+  }
+}
+for (const [index, tabId] of TAB_IDS.entries()) {
+  const tab = $(tabId);
+  tab.addEventListener("click", () => selectTab(tabId));
+  tab.addEventListener("keydown", (event) => {
+    let next = null;
+    if (event.key === "ArrowRight") next = TAB_IDS[(index + 1) % TAB_IDS.length];
+    if (event.key === "ArrowLeft") next = TAB_IDS[(index - 1 + TAB_IDS.length) % TAB_IDS.length];
+    if (event.key === "Home") next = TAB_IDS[0];
+    if (event.key === "End") next = TAB_IDS[TAB_IDS.length - 1];
+    if (!next) return;
+    event.preventDefault();
+    selectTab(next);
+    $(next).focus();
+  });
+}
+
 const urlInput = $("proxy-url");
 const saveBtn = $("save");
 const testBtn = $("test");
@@ -226,6 +331,21 @@ function renderLive(h) {
   const gate = d.gate || {};
   const rot = (h.egress || {}).rotator || {};
 
+  // Header chip: one real fact from this health snapshot, text first so the
+  // state never depends on color alone (R-25, C-4).
+  const chip = $("app-status");
+  const chipText = $("app-status-text");
+  const gateStatus = gate.status || "tidak diketahui";
+  const chipState = gateStatus === "open" ? "ok" : gateStatus === "tidak diketahui" ? "idle" : "warn";
+  chip.dataset.state = chipState;
+  chipText.textContent = gateStatus === "open"
+    ? "Upstream siap"
+    : gateStatus === "throttled"
+      ? "Upstream throttled"
+      : gateStatus === "ip-blocked"
+        ? "IP diblokir"
+        : "Gate " + gateStatus;
+
   // Card row: gate, egress IP, models, rotator. Reason: these are the four
   // facts an operator glances at, and equal weight would hide which one
   // demands attention — so the gate card carries the state color and the
@@ -266,7 +386,7 @@ function renderLive(h) {
 
   const rotVal = rot.enabled ? (rot.rotations || 0) + " rotasi" : "nonaktif";
   const rotSub = rot.enabled ? "hop otomatis saat 429" : "belum dikonfigurasi";
-  const rotCard = statusCard("Rotator WARP", rotVal, rotSub);
+  const rotCard = statusCard("Rotator " + (rot.provider === "tor" ? "Tor" : "WARP"), rotVal, rotSub);
   if (rot.enabled && rot.coolingForMs > 0) {
     rotCard.querySelector(".card-sub").textContent = "cooldown " + Math.ceil(rot.coolingForMs / 1000) + " dtk";
   }
@@ -357,6 +477,51 @@ function buildUsage(h) {
   table.append(tbody);
   return table;
 }
+
+// --- model list: every discovered model gets a real probe action ---
+async function loadModels() {
+  const list = $("model-list");
+  try {
+    const data = await readJson(await fetch("/v1/models"));
+    const ids = Array.isArray(data.data) ? data.data.map((m) => m.id).filter(Boolean) : [];
+    list.replaceChildren(...ids.map((id) => {
+      const li = document.createElement("li");
+      const name = document.createElement("span");
+      name.className = "model-id";
+      name.textContent = id;
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "tonal";
+      btn.textContent = "Uji";
+      btn.setAttribute("aria-label", "Uji model " + id);
+      btn.addEventListener("click", () => testOneModel(id, btn));
+      li.append(name, btn);
+      return li;
+    }));
+    list.hidden = ids.length === 0;
+  } catch {
+    list.hidden = true;
+  }
+}
+
+async function testOneModel(id, btn) {
+  const box = $("model-test-report");
+  box.hidden = false;
+  box.replaceChildren(line("Menguji " + id + " …"));
+  btn.disabled = true;
+  try {
+    const r = await send("/api/models/test", { model: id });
+    const cls = r.state === "ok" ? "ok" : "bad";
+    box.replaceChildren(
+      line(id + ": " + r.label + (r.durationMs ? " (" + (r.durationMs / 1000).toFixed(1) + " dtk)" : ""), cls)
+    );
+  } catch (err) {
+    box.replaceChildren(line(id + ": " + err.message, "bad"));
+  } finally {
+    btn.disabled = false;
+  }
+}
+loadModels();
 
 async function loadLive() {
   try {
@@ -588,9 +753,19 @@ function showPoolReport(nodes) {
 // --- rotator (WARP-style hop) ---
 
 const rotCmd = $("rot-command");
+const rotProvider = $("rot-provider");
+const rotControlHost = $("rot-control-host");
+const rotControlPort = $("rot-control-port");
+const rotControlPassword = $("rot-control-password");
+const rotControlCookie = $("rot-control-cookie");
+const rotTorFields = $("rot-tor-fields");
 const rotSaveBtn = $("rot-save");
 const rotHopBtn = $("rot-hop");
 const rotReport = $("rot-report");
+
+function syncRotFields() {
+  rotTorFields.hidden = rotProvider.value !== "tor";
+}
 
 function showRotReport(nodes) {
   rotReport.replaceChildren(...nodes);
@@ -604,13 +779,16 @@ function renderRotator(rot) {
   const status = $("rot-status");
   status.dataset.state = state.enabled ? (state.coolingForMs > 0 ? "cooling" : "ok") : "off";
   const bits = [];
+  const label = state.provider === "tor" ? "Tor" : "WARP";
   if (state.enabled) {
     bits.push("aktif — hop otomatis saat 429");
     if (state.coolingForMs > 0) bits.push("cooldown " + Math.ceil(state.coolingForMs / 1000) + " dtk");
-    if (state.locked) bits.push("dikunci WARP_ROTATE_CMD (environment)");
+    if (state.locked) bits.push("dikunci environment");
   } else {
     bits.push("nonaktif — 429 diteruskan apa adanya");
   }
+  bits.push("provider: " + label);
+  if (state.provider === "tor" && state.controlConfigured) bits.push("kontrol Tor siap");
   if (state.rotations) bits.push(state.rotations + " rotasi");
   if (state.lastResult && state.lastResult.at) {
     const r = state.lastResult;
@@ -623,7 +801,12 @@ function renderRotator(rot) {
 
 async function loadRotator() {
   try {
-    renderRotator(await readJson(await fetch("/api/rotator")));
+    const rot = await readJson(await fetch("/api/rotator"));
+    if (rot.provider) rotProvider.value = rot.provider;
+    if (rot.controlHost) rotControlHost.value = rot.controlHost;
+    if (rot.controlPort) rotControlPort.value = String(rot.controlPort);
+    syncRotFields();
+    renderRotator(rot);
   } catch (err) {
     // The rotator is optional; a panel served by an older bridge or a repair
     // fallback still works without this section reporting.
@@ -631,12 +814,25 @@ async function loadRotator() {
   }
 }
 
+rotProvider.addEventListener("change", syncRotFields);
 rotSaveBtn.addEventListener("click", async () => {
   try {
-    const state = await send("/api/rotator", { command: rotCmd.value });
+    const payload = {
+      provider: rotProvider.value,
+      command: rotCmd.value,
+    };
+    if (rotProvider.value === "tor") {
+      payload.controlHost = rotControlHost.value;
+      payload.controlPort = rotControlPort.value;
+      payload.controlPassword = rotControlPassword.value;
+      payload.controlCookiePath = rotControlCookie.value;
+    }
+    const state = await send("/api/rotator", payload);
     rotCmd.value = "";
+    rotControlPassword.value = "";
+    rotControlCookie.value = "";
     renderRotator(state);
-    showRotReport([line(state.enabled ? "Perintah rotasi disimpan. Hop otomatis aktif pada 429." : "Rotator dimatikan.", "ok")]);
+    showRotReport([line(state.enabled ? "Konfigurasi rotator disimpan. Hop otomatis aktif pada 429." : "Rotator dimatikan.", "ok")]);
   } catch (err) {
     showRotReport([line(err.message, "bad")]);
   }
@@ -854,30 +1050,48 @@ function renderPanel(description, { version = "", port = "" } = {}) {
 </head>
 <body>
 <main>
-  <header>
-    <h1>Proxy egress</h1>
-    <p class="sub">Arahkan semua koneksi keluar bridge lewat proxy HTTP, supaya upstream tidak melihat IP mesin ini.</p>
+  <header class="app-bar">
+    <div class="app-bar-inner">
+      <h1>Proxy egress</h1>
+      <span class="app-status" id="app-status" data-state="ok" role="status" aria-live="polite">
+        <span class="dot" aria-hidden="true"></span><span id="app-status-text">Memuat …</span>
+      </span>
+    </div>
+    <p class="sub">Kelola egress bridge: arah keluar, rotasi alamat, dan log langsung dari satu tempat.</p>
+    <div class="tabs" role="tablist" aria-label="Bagian panel">
+      <button type="button" class="tab" role="tab" id="tab-ringkasan" aria-controls="pane-ringkasan" aria-selected="true" tabindex="0">Ringkasan</button>
+      <button type="button" class="tab" role="tab" id="tab-proxy" aria-controls="pane-proxy" aria-selected="false" tabindex="-1">Proxy</button>
+      <button type="button" class="tab" role="tab" id="tab-rotator" aria-controls="pane-rotator" aria-selected="false" tabindex="-1">Rotator</button>
+      <button type="button" class="tab" role="tab" id="tab-log" aria-controls="pane-log" aria-selected="false" tabindex="-1">Log</button>
+    </div>
   </header>
 
+  <div class="panel" id="pane-ringkasan" role="tabpanel" aria-labelledby="tab-ringkasan">
   <section aria-labelledby="live-title">
     <h2 id="live-title">Ringkasan live</h2>
     <div class="live-box" id="live-box">
       <p class="live-line">Memuat …</p>
     </div>
   </section>
-
-  <section aria-labelledby="logs-title">
-    <h2 id="logs-title">Log bridge</h2>
-    <div class="logtabs">
-      <button type="button" id="log-refresh">Muat ulang</button>
-      <button type="button" id="log-copy">Copy</button>
-      <label class="log-auto"><input type="checkbox" id="log-auto" checked> Auto</label>
-    </div>
-    <pre class="logbox" id="log-box" tabindex="0" aria-label="Log bridge, terbaru di bawah"><span class="row">Memuat log …</span></pre>
-    <p class="updated" id="log-stamp"></p>
-    <p class="hint">Buffer in-memory (terakhir 500 baris sejak bridge start). Riwayat penuh tetap di service: <code>journalctl -u opencode-free-bridge -f</code> (Linux), <code>docker compose logs -f</code> (Docker), atau terminal tempat <code>bun server.js</code> jalan.</p>
+  <section aria-labelledby="models-title">
+    <h2 id="models-title">Model gratis</h2>
+    <p class="hint">Daftar model aktif dari upstream. Uji satu model untuk memastikan model itu menjawab lewat bridge ini.</p>
+    <ul class="model-list" id="model-list" hidden></ul>
+    <div class="report" id="model-test-report" role="status" aria-live="polite" hidden></div>
   </section>
 
+  <section aria-labelledby="endpoint-title">
+    <h2 id="endpoint-title">Endpoint klien</h2>
+    <dl>
+      <dt>Base URL</dt><dd>http://127.0.0.1:${escapeHtml(port || "20129")}/v1</dd>
+      <dt>API key</dt><dd>public</dd>
+      <dt>Versi</dt><dd>${escapeHtml(version || "")}</dd>
+      <dt>Health</dt><dd><a href="/health">/health</a></dd>
+    </dl>
+  </section>
+  </div>
+
+  <div class="panel" id="pane-proxy" role="tabpanel" aria-labelledby="tab-proxy" hidden>
   <section aria-labelledby="status-title">
     <h2 id="status-title">Status sekarang</h2>
     <div class="status">
@@ -905,9 +1119,9 @@ function renderPanel(description, { version = "", port = "" } = {}) {
       </select>
     </div>
     <div class="actions">
-      <button type="button" class="primary" id="pool-save">Simpan pool</button>
-      <button type="button" id="pool-test">Uji semua</button>
-      <button type="button" id="pool-clear">Kosongkan pool</button>
+      <button type="button" class="tonal" id="pool-save">Simpan pool</button>
+      <button type="button" class="tonal" id="pool-test">Uji semua</button>
+      <button type="button" class="tonal" id="pool-clear">Kosongkan pool</button>
     </div>
     <div class="report" id="pool-report" role="status" aria-live="polite" hidden></div>
   </section>
@@ -924,43 +1138,77 @@ function renderPanel(description, { version = "", port = "" } = {}) {
       </div>
       <div class="actions">
         <button type="button" class="primary" id="save">Simpan dan pakai</button>
-        <button type="button" id="test">Uji koneksi</button>
-        <button type="button" id="direct">Matikan proxy</button>
+        <button type="button" class="tonal" id="test">Uji koneksi</button>
+        <button type="button" class="tonal" id="direct">Matikan proxy</button>
       </div>
       <div class="report" id="report" role="status" aria-live="polite" hidden></div>
     </form>
   </section>
+  </div>
 
+  <div class="panel" id="pane-rotator" role="tabpanel" aria-labelledby="tab-rotator" hidden>
   <section aria-labelledby="rotator-title">
-    <h2 id="rotator-title">Rotator egress (WARP hop)</h2>
-    <p class="hint">Saat upstream menjawab <code>429</code> (jatah IP habis), bridge menjalankan perintah ini sekali, menunggu IP keluar berubah (tunnel WARP di-reconnect), lalu mengulang request yang sama lewat IP baru. Client tidak pernah melihat 429 selama rotasi berhasil. Cooldown antar-rotasi mencegah hop beruntun.</p>
+    <h2 id="rotator-title">Rotator egress (WARP / Tor)</h2>
+    <p class="hint">Saat upstream menjawab <code>429</code> (jatah IP habis), bridge mengganti alamat keluar lalu mengulang request yang sama. WARP menjalankan perintah hop; Tor mengirim <code>SIGNAL NEWNYM</code> lewat control port. Client tidak pernah melihat 429 selama rotasi berhasil.</p>
     <div class="status">
       <span class="mode" id="rot-status" data-state="off" hidden></span>
     </div>
     <div class="field">
-      <label for="rot-command">Perintah rotasi</label>
+      <label for="rot-provider">Provider</label>
+      <select id="rot-provider">
+        <option value="warp">WARP (perintah hop)</option>
+        <option value="tor">Tor (SIGNAL NEWNYM)</option>
+      </select>
+    </div>
+    <div class="field">
+      <label for="rot-command">Perintah rotasi (WARP, atau opsional untuk Tor)</label>
       <input id="rot-command" name="rot-command" type="text" autocomplete="off"
              spellcheck="false" placeholder="powershell -File C:\\warp\\hop.ps1">
-      <p class="hint">Contoh: script yang memutus dan menyambung ulang tunnel WARP (lihat <code>warp-cli disconnect</code>/<code>connect</code>), atau CLI rotator milik aplikasi lain. Kosongkan lalu simpan untuk mematikan rotator.</p>
+      <p class="hint">Untuk WARP: script reconnect tunnel. Untuk Tor: bisa dikosongkan jika control port diisi. Kosongkan keduanya untuk mematikan rotator.</p>
+    </div>
+    <div id="rot-tor-fields" hidden>
+      <div class="field">
+        <label for="rot-control-host">Host kontrol Tor</label>
+        <input id="rot-control-host" type="text" value="127.0.0.1" autocomplete="off" spellcheck="false">
+      </div>
+      <div class="field">
+        <label for="rot-control-port">Port kontrol Tor</label>
+        <input id="rot-control-port" type="number" value="9051" min="1" max="65535">
+      </div>
+      <div class="field">
+        <label for="rot-control-password">Password kontrol Tor</label>
+        <input id="rot-control-password" type="password" autocomplete="off" spellcheck="false">
+        <p class="hint">Isi password ATAU path cookie, tidak keduanya.</p>
+      </div>
+      <div class="field">
+        <label for="rot-control-cookie">Path cookie Tor</label>
+        <input id="rot-control-cookie" type="text" autocomplete="off" spellcheck="false" placeholder="/var/lib/tor/control_auth_cookie">
+      </div>
     </div>
     <div class="actions">
-      <button type="button" class="primary" id="rot-save">Simpan perintah</button>
-      <button type="button" id="rot-hop">Rotasi sekarang</button>
+      <button type="button" class="tonal" id="rot-save">Simpan konfigurasi</button>
+      <button type="button" class="tonal" id="rot-hop">Rotasi sekarang</button>
     </div>
     <div class="report" id="rot-report" role="status" aria-live="polite" hidden></div>
     <ul class="pool-list" id="rot-history" hidden></ul>
     <p class="hint">Riwayat di atas: hasil tiap percobaan rotasi (manual dan otomatis saat 429), terbaru di atas — IP sebelum → sesudah, atau alasan gagal/dilewati.</p>
   </section>
+  </div>
 
-  <section aria-labelledby="endpoint-title">
-    <h2 id="endpoint-title">Endpoint klien</h2>
-    <dl>
-      <dt>Base URL</dt><dd>http://127.0.0.1:${escapeHtml(port || "20129")}/v1</dd>
-      <dt>API key</dt><dd>public</dd>
-      <dt>Versi</dt><dd>${escapeHtml(version || "")}</dd>
-      <dt>Health</dt><dd><a href="/health">/health</a></dd>
-    </dl>
+  <div class="panel" id="pane-log" role="tabpanel" aria-labelledby="tab-log" hidden>
+  <section aria-labelledby="status-title">
+    <h2 id="logs-title">Log bridge</h2>
+    <div class="logtabs">
+      <button type="button" class="tonal" id="log-refresh">Muat ulang</button>
+      <button type="button" class="tonal" id="log-copy">Copy</button>
+      <label class="log-auto"><input type="checkbox" id="log-auto" checked> Auto</label>
+    </div>
+    <pre class="logbox" id="log-box" tabindex="0" aria-label="Log bridge, terbaru di bawah"><span class="row">Memuat log …</span></pre>
+    <p class="updated" id="log-stamp"></p>
+    <p class="hint">Buffer in-memory (terakhir 500 baris sejak bridge start). Riwayat penuh tetap di service: <code>journalctl -u opencode-free-bridge -f</code> (Linux), <code>docker compose logs -f</code> (Docker), atau terminal tempat <code>bun server.js</code> jalan.</p>
   </section>
+
+  </div>
 
   <footer>
     Proxy berlaku untuk inference, discovery model, sinkronisasi identity, dan cek update. Perubahan langsung dipakai request berikutnya, tanpa restart.

@@ -80,7 +80,14 @@ function ask(port, body) {
         port,
         path: "/v1/chat/completions",
         method: "POST",
-        headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(payload) },
+        headers: {
+          "Content-Type": "application/json",
+          "Content-Length": Buffer.byteLength(payload),
+          // Diagnostic requests must not spend the operator's egress allowance
+          // or trigger a WARP hop: the drill stages artificial 429s to test
+          // identity healing, not quota recovery.
+          "X-OpenCode-Diagnostic": "1",
+        },
       },
       (res) => {
         const chunks = [];

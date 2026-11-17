@@ -518,10 +518,19 @@ Before running the 4 live drills, `gate-drill.js` sends a single CLI-shaped cont
 | `PANEL_ALLOWED_HOSTS` | _(unset)_ | Extra `Host` names the panel and `/api/proxy` accept (comma-separated), for a reverse proxy in front of the bridge. Loopback names and the configured `HOST` are always accepted |
 | `WARP_ROTATE_CMD` | _(unset)_ | Command run once on a quota 429 (`FreeUsageLimitError`; capacity 429s pass through) to change the egress IP (WARP reconnect / hop CLI). When set it wins over the panel and locks runtime edits. See [Reactive egress rotation](#reactive-egress-rotation-warp-hop-on-429) |
 | `ROTATION_INEFFECTIVE_LIMIT` | `3` | Consecutive quota-429 rotations whose fresh address is refused again before the reactive rotator parks itself (answers 429 without hopping). A manual rotation resets the counter. |
+| `QUOTA_PLAIN_RETRIES` | `3` | Retries of a quota 429 on the same egress before the bridge considers rotating. A single upstream 429 is often transient; no hop is spent here. |
+| `QUOTA_MAX_ROTATIONS` | `10` | Maximum egress rotations in one request after the plain retries are exhausted. After this cap the client gets an explicit `quota_recovery_exhausted` error. |
+| `QUOTA_RETRY_DELAY_MS` | `1500` | Wait between plain retries on the same IP. |
+| `QUOTA_ROTATION_SETTLE_MS` | `12000` | Wait for the WARP tunnel to report Connected/healthy after a hop before resending; this avoids the `ECONNRESET` of a dial during the disconnect window. |
 | `LOG_BUFFER_LINES` | `500` | Size of the in-memory log ring buffer served to the panel's Log bridge tab (`/api/logs`). Oldest lines fall off; the full history remains with the service manager (journald, docker logs, or the foreground terminal). |
 | `WARP_ROTATE_TIMEOUT_MS` | `45000` | Whole-rotation deadline: command run + exit-IP polling. The original 429 passes through when the IP has not changed by then |
 | `WARP_ROTATE_COOLDOWN_MS` | `75000` | Minimum gap between two rotations (manual or reactive), protecting the tunnel from hop storms |
 | `WARP_ROTATE_PROBE_URL` | `https://www.cloudflare.com/cdn-cgi/trace` | IP-echo endpoint polled during a rotation; probed through the pinned proxy when one is configured, direct otherwise (TUN mode) |
+| `ROTATE_PROVIDER` | `warp` | Rotation provider: `warp` (run a hop command) or `tor` (send `SIGNAL NEWNYM` to the Tor control port). Env locks the panel. |
+| `TOR_CONTROL_HOST` | `127.0.0.1` | Tor control host for `SIGNAL NEWNYM` |
+| `TOR_CONTROL_PORT` | `9051` | Tor control port |
+| `TOR_CONTROL_PASSWORD` | _(unset)_ | Password for Tor `AUTHENTICATE` (quoted in the protocol). Env locks the panel. |
+| `TOR_CONTROL_COOKIE` | _(unset)_ | Path to Tor's `control_auth_cookie` file; bytes are hex-encoded for `AUTHENTICATE`. Env locks the panel. |
 | `AUTO_UPDATE` | `1` | Poll GitHub for bridge updates every 6 hours (automatically skipped inside a `.git` checkout; set `0` to disable) |
 | `ALLOW_NODE` | _(unset)_ | Set `ALLOW_NODE=1` to bypass the startup Bun check for offline tests |
 
@@ -671,7 +680,17 @@ The proxy applies *in addition to* the relay: with both configured, the request
 is still sent to `UPSTREAM_RELAY_URL`, and that connection is dialled through
 the proxy.
 
-### Reactive egress rotation (WARP hop on 429)
+### Testing models from the panel
+
+The *Ringkasan* tab lists every model currently advertised by `/v1/models`.
+Each row has an **Uji** button that sends one short `Reply with OK` prompt
+through the bridge's own chat route, so the probe uses the real gate anchors,
+session identity, egress proxy/pool and rotator. Results are shown inline:
+`ok`, rate limit, gate refusal, empty response, or failure. Only active free
+models can be probed; the endpoint `POST /api/models/test` is admin-guarded and
+shares one in-flight probe per model.
+
+### Reactive egress rotation (WARP / Tor hop on 429)
 
 A pool needs several egress *URLs*. A WARP-style tunnel instead changes the
 address *behind* one URL (or no URL at all, in TUN mode): reconnecting the
@@ -724,6 +743,34 @@ passes through with upstream's `Retry-After`.
 - **Config:** `<state dir>/rotator.json`, mode `0600`. The command string is
   write-only: the panel, `/api/rotator` and `/health` report *that* one exists,
   never *what* it is.
+
+#### Tor circuit rotation
+
+Set `ROTATE_PROVIDER=tor` to renew a Tor circuit instead of running a WARP hop.
+Tor exposes a SOCKS proxy, which Bun's `fetch` cannot use directly, so the
+bridge's egress must still be an **HTTP proxy in front of Tor** (Privoxy,
+torsocks+HTTP, or a GOST `socks5→http` bridge). The rotator connects to Tor's
+control port (default `127.0.0.1:9051`), authenticates with a password or cookie
+file, sends `SIGNAL NEWNYM`, then polls the exit IP through the same egress. A
+command may also be configured; when both are set, the command runs first and
+the control signal follows. At least one is required.
+
+```bash
+# local Tor daemon with password auth
+curl -s http://127.0.0.1:20129/api/rotator \
+  -H "Content-Type: application/json" \
+  -d '{"provider":"tor","controlHost":"127.0.0.1","controlPort":9051,"controlPassword":"secret"}'
+
+# or via environment (locks the panel):
+#   ROTATE_PROVIDER=tor TOR_CONTROL_PASSWORD=secret
+```
+
+A new circuit can reuse the same exit IP, especially with a small guard set.
+The bridge follows the same rule as WARP: success means the probed IP actually
+changed; otherwise the original 429 passes through. Cookie auth reads
+`TOR_CONTROL_COOKIE` as a file path and sends the bytes hex-encoded. Both
+credentials are write-only, stored in `rotator.json` with mode `0600`, and
+never echoed by `/health` or the panel.
 
 #### Verified behaviors (live warp-cli testing, Windows host)
 

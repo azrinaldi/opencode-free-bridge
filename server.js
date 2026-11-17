@@ -127,7 +127,7 @@ let proxy = loadLocalModule("proxy", PROXY_FALLBACK);
 let panel = loadLocalModule("panel", PANEL_FALLBACK);
 
 const ROTATOR_FALLBACK = {
-  describe: () => ({ enabled: false, busy: false, coolingUntil: 0, coolingForMs: 0, rotations: 0 }),
+  describe: () => ({ provider: "warp", enabled: false, busy: false, coolingUntil: 0, coolingForMs: 0, rotations: 0, history: [] }),
   rotate: async () => ({ ok: false, skipped: "disabled", error: "rotator.js belum terpasang." }),
   setConfig: () => ({ ok: false, error: "rotator.js belum terpasang. Jalankan ulang install.sh." }),
 };
@@ -171,7 +171,7 @@ async function repairMissingModules(dir = __dirname) {
   const fs = require("fs");
   const path = require("path");
   const required = new Set(localRequires(fs.readFileSync(path.join(dir, "server.js"), "utf8")));
-  for (const name of ["proxy.js", "panel.js", "rotator.js"]) required.add(name);
+  for (const name of ["proxy.js", "panel.js", "rotator.js", "tor-control.js"]) required.add(name);
   const missing = [...required].filter((f) => !fs.existsSync(path.join(dir, f)));
   const repaired = [];
   const failed = [];
@@ -213,6 +213,10 @@ async function repairMissingModules(dir = __dirname) {
 const PORT = parseInt(process.env.PORT || "20129", 10);
 const HOST = process.env.HOST || "127.0.0.1";
 const UPSTREAM_TIMEOUT_MS = parseInt(process.env.UPSTREAM_TIMEOUT_MS || "120000", 10);
+// Each retry inside quota recovery gets its own short deadline. Without this,
+// a resend whose TCP connection stalls can hang for minutes and the 10-hop
+// budget takes far longer than the operator expects.
+const QUOTA_RESEND_TIMEOUT_MS = parseInt(process.env.QUOTA_RESEND_TIMEOUT_MS || "20000", 10);
 const MAX_BODY_BYTES = parseInt(process.env.MAX_BODY_BYTES || String(10 * 1024 * 1024), 10);
 const GATE_RETRY_COOLDOWN_MS = parseInt(
   process.env.GATE_RETRY_COOLDOWN_MS || "30000",
@@ -232,6 +236,33 @@ const ROTATION_INEFFECTIVE_LIMIT = parseInt(
   10
 );
 let rotationIneffectiveRuns = 0;
+// Quota-429 recovery policy, in order:
+//   1. retry the same egress up to N times (no hop) for a transient refusal;
+//   2. hop the egress at most M times, waiting for the tunnel between hops;
+//   3. if all M hops still end in 429, answer with an explicit exhaustion error.
+// Keeping the counts here (not scattered in the handler) makes the cap
+// observable in /health and keeps one client request from hopping forever.
+const QUOTA_PLAIN_RETRIES = Math.max(0, Math.min(10, parseInt(process.env.QUOTA_PLAIN_RETRIES || "3", 10)));
+const QUOTA_MAX_ROTATIONS = Math.max(1, Math.min(50, parseInt(process.env.QUOTA_MAX_ROTATIONS || "10", 10)));
+const QUOTA_RETRY_DELAY_MS = Math.max(0, Math.min(60000, parseInt(process.env.QUOTA_RETRY_DELAY_MS || "1500", 10)));
+const QUOTA_ROTATION_SETTLE_MS = Math.max(0, Math.min(60000, parseInt(process.env.QUOTA_ROTATION_SETTLE_MS || "12000", 10)));
+let quotaRecoveryStats = { attempts: 0, rotations: 0, exhausted: 0 };
+
+/**
+ * Test seam: adjust the recovery policy without restarting the process.
+ * Production reads the env constants once at boot; tests with several files
+ * share one module instance and cannot rely on env being set before require.
+ */
+function __setQuotaPolicy({ plainRetries, maxRotations, retryDelayMs, rotationSettleMs } = {}) {
+  if (Number.isInteger(plainRetries)) quotaPlainRetries = Math.max(0, Math.min(10, plainRetries));
+  if (Number.isInteger(maxRotations)) quotaMaxRotations = Math.max(1, Math.min(50, maxRotations));
+  if (Number.isInteger(retryDelayMs)) quotaRetryDelayMs = Math.max(0, Math.min(60000, retryDelayMs));
+  if (Number.isInteger(rotationSettleMs)) quotaRotationSettleMs = Math.max(0, Math.min(60000, rotationSettleMs));
+}
+let quotaPlainRetries = QUOTA_PLAIN_RETRIES;
+let quotaMaxRotations = QUOTA_MAX_ROTATIONS;
+let quotaRetryDelayMs = QUOTA_RETRY_DELAY_MS;
+let quotaRotationSettleMs = QUOTA_ROTATION_SETTLE_MS;
 const CORS_ORIGIN = process.env.CORS_ORIGIN !== undefined ? process.env.CORS_ORIGIN : "";
 // Optional egress relay. When set, every upstream inference request is sent to
 // this relay URL instead of directly to opencode.ai, with the real origin and
@@ -288,6 +319,7 @@ const UPDATE_FILES = [
   "proxy.js",
   "panel.js",
   "rotator.js",
+  "tor-control.js",
   "egress-proxy.js",
   "anthropic.js",
   "server.js",
@@ -612,7 +644,7 @@ function retryAfterMs(res) {
 async function maybeRotateOn429(req, res, egressState) {
   const state = rotator.describe();
   if (!state.enabled) return false;
-  if (rotationIneffectiveRuns >= ROTATION_INEFFECTIVE_LIMIT) {
+  if (rotationIneffectiveRuns >= Math.max(ROTATION_INEFFECTIVE_LIMIT, quotaMaxRotations)) {
     console.warn(
       `[opencode-free-bridge] Rotator skipped on 429: ${rotationIneffectiveRuns} consecutive rotations bought no working allowance; waiting for the allowance window instead of hopping again`
     );
@@ -624,14 +656,6 @@ async function maybeRotateOn429(req, res, egressState) {
   // waiting out the rest of the cooldown protects nothing — the operator's
   // call was "if the newest IP still 429s, hop again right away". Single-flight
   // (busy) still serializes hops and the breaker above still caps the futility.
-  if (state.coolingForMs > 0 && rotationIneffectiveRuns === 0) {
-    console.warn(
-      `[opencode-free-bridge] Rotator skipped on 429: cooling ${Math.ceil(
-        state.coolingForMs / 1000
-      )}s (hop cooldown; the previous hop is still fresh)`
-    );
-    return false;
-  }
   if (state.busy) {
     console.warn("[opencode-free-bridge] Rotator skipped on 429: busy");
     return false;
@@ -655,10 +679,11 @@ async function maybeRotateOn429(req, res, egressState) {
     .rotate({
       egressUrl: egressState.egressUrl ?? null,
       trigger: "429",
-      // The fresh address was already refused (counter > 0): cooldown paces a
-      // hop whose outcome is unknown, and this one's outcome is known-spent.
-      // The breaker above still caps how many of these justified hops run.
-      ignoreCooldown: rotationIneffectiveRuns > 0,
+      // In the bounded recovery loop the address is known-spent: cooldown
+      // paces hops whose outcome is unknown, so it would only stall a retry
+      // the operator explicitly asked for. Single-flight and the hourly cap
+      // still apply, and the loop's own counter caps the hop count.
+      ignoreCooldown: true,
     })
     .catch((err) => ({
       ok: false,
@@ -1949,6 +1974,98 @@ function getPersistentSessionId(req, body) {
 }
 
 /**
+ * `/api/models/test` — probe one discovered model through the bridge's own
+ * chat route. A dedicated endpoint keeps the real gate anchors, session
+ * minting, egress proxy/pool, and reactive rotation in one place: the probe
+ * dials this process over loopback instead of duplicating the upstream call.
+ *
+ * Admin-guarded like the rest of the configuration surface: a probe spends
+ * the per-IP free allowance, so a foreign page must not be able to trigger it.
+ * One probe per model at a time; concurrent clicks share the same result.
+ */
+const modelTestInFlight = new Map();
+
+function classifyModelTest(status, body) {
+  const msg = String(body?.error?.message || body?.error || "");
+  if (status === 429) {
+    if (body?.error?.code === "quota_recovery_exhausted") {
+      return { state: "busy", label: body.error.message || "Sudah 10x rotasi tapi kuota masih habis" };
+    }
+    return { state: "busy", label: "Rate limit / jatah habis" };
+  }
+  if (status === 403) {
+    if (/abusive traffic|abuse traffic|abuse of traffic/i.test(msg)) return { state: "blocked", label: "IP diblokir upstream" };
+    return { state: "blocked", label: "Gate menolak IP ini" };
+  }
+  if (status === 404) return { state: "failed", label: "Model tidak tersedia" };
+  if (status !== 200) return { state: "failed", label: msg.slice(0, 120) || `HTTP ${status}` };
+  const choice = body?.choices?.[0];
+  const content = String(choice?.message?.content || "").trim();
+  const reasoning = String(choice?.message?.reasoning_content || "").trim();
+  if (!content && reasoning) return { state: "failed", label: "Hanya reasoning, tanpa jawaban" };
+  if (!content) return { state: "failed", label: "Respons kosong" };
+  return { state: "ok", label: content.slice(0, 120), chars: content.length };
+}
+
+async function testModel(model) {
+  const id = String(model || "").trim();
+  if (!id) return { ok: false, state: "failed", label: "Model kosong" };
+  if (modelTestInFlight.has(id)) return modelTestInFlight.get(id);
+  const started = Date.now();
+  const promise = (async () => {
+    try {
+      // The chat route requires stream:true upstream, but folds SSE back to
+      // JSON for a non-streaming client. Ask for JSON so the verdict can read
+      // one envelope; max_tokens is small because this is a readiness probe.
+      const body = JSON.stringify({
+        model: id,
+        messages: [{ role: "user", content: "Reply with OK" }],
+        max_tokens: 50,
+        stream: false,
+      });
+      const res = await new Promise((resolve, reject) => {
+        const req = http.request({
+          host: HOST === "0.0.0.0" || HOST === "::" ? "127.0.0.1" : HOST,
+          port: PORT,
+          path: "/v1/chat/completions",
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Content-Length": Buffer.byteLength(body),
+            Authorization: "Bearer public",
+          },
+        }, (response) => {
+          let raw = "";
+          response.on("data", (c) => (raw += c));
+          response.on("end", () => {
+            let parsed = null;
+            try { parsed = JSON.parse(raw); } catch {}
+            resolve({ status: response.statusCode, body: parsed, raw });
+          });
+        });
+        req.on("error", reject);
+        req.setTimeout(15 * 60 * 1000, () => req.destroy(new Error("timeout")));
+        req.write(body);
+        req.end();
+      });
+      const verdict = classifyModelTest(res.status, res.body);
+      return {
+        ok: verdict.state === "ok",
+        state: verdict.state,
+        label: verdict.label,
+        status: res.status,
+        chars: verdict.chars || 0,
+        durationMs: Date.now() - started,
+      };
+    } catch (err) {
+      return { ok: false, state: "failed", label: err.message || "Probe gagal", durationMs: Date.now() - started };
+    }
+  })();
+  modelTestInFlight.set(id, promise);
+  try { return await promise; } finally { modelTestInFlight.delete(id); }
+}
+
+/**
  * `/api/proxy` — read and change the egress proxy; `/api/proxy/test` — prove a
  * candidate reaches upstream before it is trusted.
  *
@@ -2126,11 +2243,15 @@ async function handleRotatorApi(req, res, pathname) {
   }
 
   const configPatch = {};
-  for (const key of ["command", "timeoutMs", "cooldownMs", "probeUrl"]) {
+  const configKeys = [
+    "command", "timeoutMs", "cooldownMs", "probeUrl",
+    "provider", "controlHost", "controlPort", "controlPassword", "controlCookiePath",
+  ];
+  for (const key of configKeys) {
     if (Object.prototype.hasOwnProperty.call(payload, key)) configPatch[key] = payload[key];
   }
   if (Object.keys(configPatch).length === 0) {
-    return send(400, { error: "Body harus berisi 'rotate': true, atau kolom konfigurasi (command, timeoutMs, cooldownMs, probeUrl)." });
+    return send(400, { error: `Body harus berisi 'rotate': true, atau kolom konfigurasi (${configKeys.join(", ")}).` });
   }
   const result = rotator.setConfig(configPatch);
   return send(result.ok ? 200 : 400, result);
@@ -2279,6 +2400,51 @@ function handleRequest(req, res) {
     return res.end(req.method === "HEAD" ? undefined : body);
   }
 
+  if (pathname === "/api/models/test") {
+    const denied = adminRequestError(req);
+    if (denied) {
+      res.writeHead(403, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+      return res.end(JSON.stringify({ error: denied }));
+    }
+    if (req.method !== "POST") {
+      res.setHeader("Allow", "POST");
+      res.writeHead(405, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+      return res.end(JSON.stringify({ error: "Gunakan POST untuk menguji model." }));
+    }
+    const type = String(req.headers?.["content-type"] || "").split(";")[0].trim().toLowerCase();
+    if (type !== "application/json") {
+      res.writeHead(415, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+      return res.end(JSON.stringify({ error: "Content-Type harus application/json." }));
+    }
+    (async () => {
+      let payload = {};
+      try {
+        const raw = await readRequestBody(req, 16 * 1024);
+        payload = raw ? JSON.parse(raw) : {};
+      } catch (err) {
+        return { status: 400, body: { error: `Body tidak valid: ${err.message}` } };
+      }
+      const model = payload && typeof payload === "object" ? payload.model : null;
+      if (typeof model !== "string" || !String(model).trim()) {
+        return { status: 400, body: { error: "Body harus berisi 'model'." } };
+      }
+      // Only a model the bridge actually advertises may be probed: an arbitrary
+      // id would burn allowance on a paid/retired model the operator did not ask for.
+      const allowed = activeModels.some((m) => m.id === String(model).trim());
+      if (!allowed) return { status: 404, body: { error: "Model tidak ada di daftar aktif." } };
+      const result = await testModel(model);
+      return { status: 200, body: result };
+    })().then(({ status, body }) => {
+      res.writeHead(status, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+      res.end(JSON.stringify(body));
+    }).catch((err) => {
+      if (res.headersSent) return res.destroy();
+      res.writeHead(500, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+      res.end(JSON.stringify({ error: `Kesalahan internal: ${err.message}` }));
+    });
+    return;
+  }
+
   if (pathname === "/api/rotator") {
     const denied = adminRequestError(req);
     if (denied) {
@@ -2375,6 +2541,11 @@ function handleRequest(req, res) {
             ...rotator.describe(),
             rotationIneffective: rotationIneffectiveRuns,
             rotationIneffectiveLimit: ROTATION_INEFFECTIVE_LIMIT,
+            quotaRecovery: {
+              plainRetries: quotaPlainRetries,
+              maxRotations: quotaMaxRotations,
+              ...quotaRecoveryStats,
+            },
           },
           // Per-egress wire traffic and token accounting (usage.json). The
           // phone entry here is the mobile-data cost of the bridge today.
@@ -2597,10 +2768,23 @@ function handleRequest(req, res) {
       const abortController = new AbortController();
       let timedOut = false;
       let clientDisconnected = false;
-      const timeoutId = setTimeout(() => {
+      let requestDeadlineAt = Date.now() + UPSTREAM_TIMEOUT_MS;
+      let timeoutId = setTimeout(() => {
         timedOut = true;
         abortController.abort(new Error("Upstream request timed out"));
       }, UPSTREAM_TIMEOUT_MS);
+      // Each hop is a deliberate, bounded piece of work (~16s of tunnel gap).
+      // Give the request enough total time for the configured recovery loop
+      // instead of aborting mid-way with a 504 that hides the real verdict.
+      const extendRequestTimeout = (extraMs) => {
+        if (timedOut) return;
+        requestDeadlineAt = Date.now() + extraMs;
+        clearTimeout(timeoutId);
+        timeoutId = setTimeout(() => {
+          timedOut = true;
+          abortController.abort(new Error("Upstream request timed out"));
+        }, requestDeadlineAt - Date.now());
+      };
 
       const onClose = () => {
         if (!res.writableEnded) {
@@ -2626,12 +2810,30 @@ function handleRequest(req, res) {
         egressState.egressUrl = egressState.egress.url;
         const egressUrl = () => egressState.egressUrl;
 
-        let upstreamRes = await egressFetch(upstreamUrl, {
-          method: "POST",
-          headers: upstreamHeaders,
-          body: JSON.stringify(upstreamBody),
-          signal: abortController.signal,
-        }, egressState);
+        // A request that starts while another hop's tunnel is down dies on the
+        // first dial with ECONNRESET. Retry the same dial a few times with a
+        // short backoff: by then the tunnel is usually back, and the client
+        // never sees the transport error. This is separate from the quota-429
+        // loop below, which only runs after upstream answered a real 429.
+        let upstreamRes = null;
+        for (let dial = 0; dial < 4; dial += 1) {
+          try {
+            upstreamRes = await egressFetch(upstreamUrl, {
+              method: "POST",
+              headers: upstreamHeaders,
+              body: JSON.stringify(upstreamBody),
+              signal: abortController.signal,
+            }, egressState);
+            break;
+          } catch (err) {
+            const deadTunnel = err?.code === "ECONNRESET" || err?.code === "ECONNREFUSED" || err?.code === "ConnectionRefused";
+            const hopNear = rotator.describe().busy ||
+              (() => { const t = rotator.describe().lastRotationAt; return t && Date.now() - t < 25_000; })();
+            if (!deadTunnel || !hopNear || dial === 3) throw err;
+            console.warn(`[opencode-free-bridge] Dial ${dial + 1}/4 hit ${err.code} while the tunnel was down; retrying`);
+            await new Promise((r) => setTimeout(r, 2000));
+          }
+        }
 
         // If a newly released model requires the opposite protocol lane, learn it
         // and transparently retry once on the matching lane.
@@ -2883,37 +3085,191 @@ function handleRequest(req, res) {
           })();
           if (type429 === "RateLimitError" || /endpoint is unavailable|try again/i.test(msg429)) {
             capacity429 = true;
-          } else {
-            // Default: treat as the quota kind. FreeUsageLimitError matches
-            // explicitly; anything unparseable keeps the historical behavior
-            // (the allowance answer was observed without parseable JSON too).
+          } else if (
+            type429 === "FreeUsageLimitError" ||
+            /free usage|free.?tier.*(limit|quota|allowance)|quota spent/i.test(msg429)
+          ) {
+            // Only the per-IP allowance kind enters the bounded recovery loop.
             quota429 = true;
           }
+          // Anything else falls through untouched. Treating every unparseable
+          // 429 as a quota refusal made diagnostic drills spend real hops.
         }
-        if (quota429) {
-          const rotated = await maybeRotateOn429(req, res, egressState);
-          if (rotated) {
-            upstreamRes = await egressFetch(upstreamUrl, {
-              method: "POST",
-              headers: upstreamHeaders,
-              body: JSON.stringify(upstreamBody),
-              signal: abortController.signal,
-            }, egressState.egressUrl);
-            consumedErrorText = null;
+        // Diagnostic drills stage artificial 429s to exercise identity
+        // healing. Spending real hops on them would both skew the drill and
+        // burn the operator's allowance, so they keep the plain passthrough.
+        const diagnosticRequest = String(req.headers?.["x-opencode-diagnostic"] || "") === "1";
+        if (quota429 && !diagnosticRequest) {
+          // Bounded recovery: retry the same IP a few times first (a single
+          // upstream 429 is often transient), then spend at most
+          // QUOTA_MAX_ROTATIONS hops. Every retry uses the same request body,
+          // headers and egress state; only the egress IP changes after a hop.
+          let plainTries = 0;
+          let rotationsUsed = 0;
+          let exhausted = false;
+          quotaRecoveryStats.attempts += 1;
+
+          const isRetryableQuotaTransport = (err) =>
+            err?.code === "ECONNRESET" || err?.code === "ECONNREFUSED" ||
+            err?.code === "ConnectionRefused" || /timed out|aborted/i.test(String(err?.message || ""));
+
+          const resend = async (egressUrl) => {
+            // Bound every resend independently. A stalled socket through a
+            // fresh WARP address otherwise blocks the loop for minutes.
+            const local = new AbortController();
+            const onAbort = () => local.abort(abortController.signal.reason);
+            if (abortController.signal.aborted) local.abort(abortController.signal.reason);
+            else abortController.signal.addEventListener("abort", onAbort, { once: true });
+            const timer = setTimeout(() => local.abort(new Error("quota resend timed out")), QUOTA_RESEND_TIMEOUT_MS);
+            try {
+              const res = await egressFetch(upstreamUrl, {
+                method: "POST",
+                headers: upstreamHeaders,
+                body: JSON.stringify(upstreamBody),
+                signal: local.signal,
+              }, egressUrl);
+              // Errors need the body to classify the refusal; capture it once so
+              // both this loop and the generic error branch below can read it.
+              if (!res.ok) {
+                try { consumedErrorText = await res.text(); } catch { consumedErrorText = null; }
+              } else {
+                consumedErrorText = null;
+              }
+              return res;
+            } finally {
+              clearTimeout(timer);
+              abortController.signal.removeEventListener("abort", onAbort);
+            }
+          };
+
+          // Classify a response as quota-429. A capacity 429 (RateLimitError)
+          // is a different upstream condition and must not trigger a hop.
+          const isQuota429 = (res, text) => {
+            if (!res || res.status !== 429) return false;
+            try {
+              const j = JSON.parse(text || "");
+              const type = j?.error?.type || j?.type || "";
+              const msg = j?.error?.message || j?.message || "";
+              if (type === "RateLimitError" || /endpoint is unavailable|try again/i.test(msg)) return false;
+              if (type === "FreeUsageLimitError" || /free usage|free.?tier.*(limit|quota|allowance)/i.test(msg)) return true;
+              return false;
+            } catch {
+              return false; // unparseable 429 must not spend hops blindly
+            }
+          };
+
+          const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+          const waitForTunnel = async (settleMs) => {
+            // A hop disconnects the TUN for ~10s. Re-dial during that window
+            // produces ECONNRESET, which is what the operator saw. Use the
+            // local control status as the readiness signal: an upstream IP
+            // echo can itself be 429'd, which would stall this wait forever.
+            // Any "Connected" + "healthy" wording counts; a fixed floor keeps
+            // the pace even when warp-cli prints no detail.
+            const { execFile } = require("child_process");
+            const deadline = Date.now() + settleMs;
+            while (Date.now() < deadline) {
+              let status = "";
+              try {
+                status = await new Promise((resolve) =>
+                  execFile("warp-cli", ["--accept-tos", "status"], { timeout: 3000 }, (err, out) =>
+                    resolve(String(err ? "" : out))
+                  )
+                );
+              } catch {}
+              if (/Connected/i.test(status) && /healthy/i.test(status)) return;
+              await sleep(2000);
+            }
+          };
+
+          while (true) {
+            const previous429Text = consumedErrorText;
+            if (plainTries < quotaPlainRetries) {
+              plainTries += 1;
+              console.warn(`[opencode-free-bridge] Quota 429: retry ${plainTries}/${quotaPlainRetries} on the same egress before rotating`);
+              if (quotaRetryDelayMs) await sleep(quotaRetryDelayMs);
+              try {
+                upstreamRes = await resend(egressState.egressUrl);
+              } catch (err) {
+                if (isRetryableQuotaTransport(err) || /quota resend timed out/.test(String(err?.message))) {
+                  console.warn(`[opencode-free-bridge] Transport "${err?.code || err?.message}" while retrying; treating as a failed attempt`);
+                  continue;
+                }
+                throw err;
+              }
+              if (upstreamRes.ok) break;
+              if (!isQuota429(upstreamRes, consumedErrorText || previous429Text)) break;
+              continue;
+            }
+
+            if (rotationsUsed >= quotaMaxRotations) {
+              exhausted = true;
+              break;
+            }
+
+            const rotated = await maybeRotateOn429(req, res, egressState);
+            if (!rotated) {
+              // Cooling, breaker, disabled, or client gone: there is nothing
+              // more this request can do. Preserve the 429 and its truthful
+              // Retry-After rather than inventing another hop.
+              break;
+            }
+            // Extend BEFORE the hop: the tunnel gap already consumes ~16s of
+            // the request budget, and an abort mid-dial is what surfaced as
+            // ECONNRESET to the client.
+            extendRequestTimeout(45_000 + quotaRotationSettleMs);
+            rotationsUsed += 1;
+            quotaRecoveryStats.rotations += 1;
+            await waitForTunnel(quotaRotationSettleMs);
+            try {
+              upstreamRes = await resend(egressState.egressUrl);
+            } catch (err) {
+              if (isRetryableQuotaTransport(err) || /quota resend timed out/.test(String(err?.message))) {
+                console.warn(`[opencode-free-bridge] Transport "${err?.code || err?.message}" after rotation ${rotationsUsed}; continuing the recovery loop`);
+                // The next iteration will try another hop; reset the plain
+                // counter so every fresh IP gets its own quiet retry window.
+                plainTries = quotaPlainRetries;
+                continue;
+              }
+              throw err;
+            }
             if (upstreamRes.ok) {
               proxy.markSuccess(egressState.egressUrl);
               rotationIneffectiveRuns = 0;
-              console.warn("[opencode-free-bridge] 429 cleared by egress rotation; upstream accepted the retry");
-            } else if (upstreamRes.status === 429) {
-              // Still spent on the fresh address too. The Retry-After must
-              // reach the client; the generic error branch below handles that
-              // because `upstreamRes` is what it reads.
-              recordEgressFailure(egressState, {
-                reason: "allowance 429 after rotation",
-                cooldownMs: retryAfterMs(upstreamRes) ?? null,
-              });
-              rotationIneffectiveRuns += 1;
+              console.warn(`[opencode-free-bridge] 429 cleared after ${rotationsUsed} rotation(s); upstream accepted the retry`);
+              break;
             }
+            if (!isQuota429(upstreamRes, consumedErrorText)) break;
+            // Fresh IP still spent. Keep the Retry-After and let the next
+            // iteration hop again; cap prevents an endless loop.
+            recordEgressFailure(egressState, {
+              reason: "allowance 429 after rotation",
+              cooldownMs: retryAfterMs(upstreamRes) ?? null,
+            });
+            rotationIneffectiveRuns += 1;
+            plainTries = quotaPlainRetries;
+          }
+
+          if (exhausted) {
+            quotaRecoveryStats.exhausted += 1;
+            const retryAfter = retryAfterMs(upstreamRes);
+            if (!res.headersSent) {
+              res.writeHead(429, {
+                "Content-Type": "application/json",
+                "Cache-Control": "no-store",
+                ...(retryAfter ? { "Retry-After": String(Math.ceil(retryAfter / 1000)) } : {}),
+              });
+              return res.end(JSON.stringify({
+                error: {
+                  message: `Upstream free-tier allowance is still exhausted after ${quotaPlainRetries} retries and ${quotaMaxRotations} egress rotations. Wait for the allowance window or add another egress.`,
+                  type: "free_tier_quota_exhausted",
+                  code: "quota_recovery_exhausted",
+                  retries: quotaPlainRetries,
+                  rotations: quotaMaxRotations,
+                },
+              }));
+            }
+            return res.end();
           }
         }
 
@@ -3699,7 +4055,7 @@ function handleRequest(req, res) {
             return res.end(
               JSON.stringify({
                 error: {
-                  message: `Upstream request timed out after ${UPSTREAM_TIMEOUT_MS}ms`,
+                  message: `Upstream request timed out after ${Math.max(0, requestDeadlineAt - Date.now())}ms of remaining quota-recovery budget`,
                   type: "timeout_error",
                   code: 504,
                 },
@@ -3947,6 +4303,7 @@ module.exports = {
     rebuildDiscoveryPayloads();
   },
   __getDiscoveryState: () => ({ inFlight: !!discoveryInFlight, lastDiscoveryTime, activeModels }),
+  __setQuotaPolicy,
   __setLastCliVersionCheckTime: (v) => { lastCliVersionCheckTime = v; },
   __getCliVersionState: () => ({ lastCliVersionCheckTime }),
   __setLastUpdateCheck: (v) => { lastUpdateCheck = v; },

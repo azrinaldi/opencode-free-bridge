@@ -1,6 +1,6 @@
 {
   "name": "opencode-free-bridge",
-  "version": "2.6.0",
+  "version": "2.7.1",
   "description": "OpenAI-compatible bridge to OpenCode free-tier models (no account required), self-adapting to gate changes",
   "main": "server.js",
   "bin": {
@@ -33,6 +33,7 @@
     "THIRD_PARTY_NOTICES.md",
     "egress-proxy.js",
     "rotator.js",
+    "tor-control.js",
     "transport-fingerprint.js",
     "transport-baseline.json",
     "tunnel-doctor.sh",

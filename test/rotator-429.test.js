@@ -5,7 +5,8 @@ const os = require("node:os");
 const path = require("node:path");
 const http = require("node:http");
 
-const { server, identity } = require("../server");
+const serverModule = require("../server");
+const { server, identity } = serverModule;
 const rotator = require("../rotator");
 const proxy = require("../proxy");
 
@@ -78,6 +79,9 @@ describe("429 → egress rotation → retry (server flow)", () => {
   });
 
   beforeEach(() => {
+    // Runtime seam: the module is shared across test files, so set the policy
+    // per test instead of depending on env read at module load.
+    serverModule.__setQuotaPolicy({ plainRetries: 2, maxRotations: 3, retryDelayMs: 0, rotationSettleMs: 0 });
     identity.__reset();
     identity.__setLastCheckTime(Date.now());
     // stateDir is already the process-wide OPENCODE_BRIDGE_STATE_DIR (set in
@@ -98,6 +102,7 @@ describe("429 → egress rotation → retry (server flow)", () => {
       if (value === undefined) delete process.env[key];
       else process.env[key] = value;
     }
+    serverModule.__setQuotaPolicy({ plainRetries: 3, maxRotations: 10, retryDelayMs: 1500, rotationSettleMs: 12000 });
     proxy.__reload();
     await new Promise((resolve) => server.close(resolve));
   });
@@ -150,11 +155,11 @@ describe("429 → egress rotation → retry (server flow)", () => {
     });
     assert.equal(res.status, 429);
     assert.equal(res.headers["retry-after"], "600");
-    assert.equal(calls, 1, "no rotation, no retry");
+    assert.equal(calls, 3, "initial 429 + 2 plain retries; no rotation when rotator is off");
     assert.equal(rotator.describe().rotations, 0);
   });
 
-  it("rotates once on 429 and returns the retry's 200 to the client", async () => {
+  it("retries on the same egress first, then rotates only if still 429", async () => {
     const flag = path.join(stateDir, "hopped");
     try { fs.unlinkSync(flag); } catch {}
     fs.writeFileSync(
@@ -168,7 +173,7 @@ describe("429 → egress rotation → retry (server flow)", () => {
     let upstreamCalls = 0;
     mockFetchImpl = async () => {
       upstreamCalls++;
-      if (upstreamCalls === 1) return UP429();
+      if (upstreamCalls <= 3) return UP429();
       return { ok: true, status: 200, body: sse(OK_SSE) };
     };
     // The probe reads the flag: the IP only changes once the command ran.
@@ -185,7 +190,7 @@ describe("429 → egress rotation → retry (server flow)", () => {
 
     assert.equal(res.status, 200);
     assert.match(res.raw, /\[DONE\]/);
-    assert.equal(upstreamCalls, 2, "initial 429 + one retry after rotation");
+    assert.equal(upstreamCalls, 4, "initial 429 + 2 plain retries + 1 retry after rotation");
     const desc = rotator.describe();
     assert.equal(desc.rotations, 1);
     assert.equal(desc.lastResult.ok, true);
@@ -193,7 +198,7 @@ describe("429 → egress rotation → retry (server flow)", () => {
     rotator.__setProbeImpl(null);
   });
 
-  it("answers the original 429 with its Retry-After when rotation never changes the IP", async () => {
+  it("answers the original 429 when a hop command fails (no fabricated exhaustion)", async () => {
     fs.writeFileSync(
       path.join(stateDir, "rotator.json"),
       JSON.stringify({ command: "noop", timeoutMs: 3000, cooldownMs: 1000 })
@@ -209,7 +214,35 @@ describe("429 → egress rotation → retry (server flow)", () => {
     });
     assert.equal(res.status, 429);
     assert.equal(res.headers["retry-after"], "600", "the truthful Retry-After survives");
-    assert.equal(upstreamCalls, 1, "no retry without a changed IP");
+    // `noop` is not a valid shell command here, so the rotation itself fails
+    // and recovery stops with the original refusal; no exhaustion claim.
+    assert.equal(upstreamCalls, 3, "initial 429 + 2 plain retries; failed hop aborts recovery");
+    assert.equal(rotator.describe().rotations, 1, "one failed hop recorded, then recovery stops");
+    rotator.__setProbeImpl(null);
+  });
+
+  it("reports explicit exhaustion after all configured rotations still return 429", async () => {
+    fs.writeFileSync(
+      path.join(stateDir, "rotator.json"),
+      JSON.stringify({ command: process.platform === "win32" ? "cmd /c exit 0" : "true", timeoutMs: 3000, cooldownMs: 1000 })
+    );
+    let upstreamCalls = 0;
+    mockFetchImpl = async () => { upstreamCalls++; return UP429(); };
+    // Command succeeds and the probe sees a different IP each hop, but upstream
+    // still 429s every address: the loop must still reach its cap and report it.
+    let probeN = 0;
+    rotator.__setProbeImpl(async () => ({ ip: `203.0.113.${10 + probeN++}`, error: null }));
+
+    const res = await httpRequest(port, "POST", "/v1/chat/completions", {
+      model: "big-pickle",
+      stream: true,
+      messages: [{ role: "user", content: "hi" }],
+    });
+    assert.equal(res.status, 429);
+    assert.equal(res.body.error.code, "quota_recovery_exhausted");
+    assert.match(res.body.error.message, /after 2 retries and 3 egress rotations/);
+    assert.equal(upstreamCalls, 6, "initial + 2 plain retries + 3 post-hop retries");
+    assert.equal(rotator.describe().rotations, 3);
     rotator.__setProbeImpl(null);
   });
 
@@ -371,7 +404,7 @@ describe("429 → egress rotation → retry (server flow)", () => {
     let upstreamCalls = 0;
     mockFetchImpl = async () => {
       upstreamCalls++;
-      if (upstreamCalls === 1) return UP429();
+      if (upstreamCalls <= 3) return UP429();
       return { ok: true, status: 200, body: sse(OK_SSE) };
     };
     try {
@@ -428,18 +461,14 @@ describe("429 → egress rotation → retry (server flow)", () => {
     mockFetchImpl = async () => UP429();
     rotator.__setProbeImpl(async () => ({ ip: `203.0.113.${Date.now() % 250}`, error: null }));
     try {
-      for (let i = 0; i < 3; i += 1) {
-        const res = await post();
-        assert.equal(res.status, 429, `attempt ${i + 1}: fresh IP also refused`);
-        assert.equal(rotator.describe().rotations, i + 1, `attempt ${i + 1}: exactly one rotation ran`);
-      }
-      // Breaker is now tripped: the next 429 must not rotate at all.
       const res = await post();
       assert.equal(res.status, 429);
-      assert.equal(rotator.describe().rotations, 3, "no fourth hop after the breaker trips");
+      assert.equal(res.body.error.code, "quota_recovery_exhausted");
+      assert.equal(rotator.describe().rotations, 3, "exactly the configured 3 hops ran in one request");
       const health = await httpRequest(port, "GET", "/health");
-      assert.equal(health.body.egress.rotator.rotationIneffective, 3);
-      assert.equal(health.body.egress.rotator.rotationIneffectiveLimit, 3);
+      assert.equal(health.body.egress.rotator.quotaRecovery.maxRotations, 3);
+      assert.equal(health.body.egress.rotator.quotaRecovery.plainRetries, 2);
+      assert.equal(health.body.egress.rotator.quotaRecovery.exhausted >= 1, true);
     } finally {
       rotator.__setProbeImpl(null);
       // Clear the module-level breaker so other tests start clean: a manual
