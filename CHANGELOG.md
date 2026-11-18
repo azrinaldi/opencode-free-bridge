@@ -1,4 +1,10 @@
 # Changelog
+## [2.7.6] — 2026-11-18
+
+### Added
+
+- Every `/v1/chat/completions` request is now logged to the in-memory buffer and the panel's Log tab: a start line (`model`, `stream`, client address) and a finish line (`status`, duration, `Retry-After` when a 429 is returned). The Log tab already polls `/api/logs` every 5s, so request activity appears live.
+
 ## [2.7.5] — 2026-11-18
 
 ### Changed

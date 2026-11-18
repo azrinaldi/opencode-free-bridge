@@ -2727,6 +2727,19 @@ function handleRequest(req, res) {
           })
         );
       }
+      const reqStartAt = Date.now();
+      const reqClient = String(req.socket?.remoteAddress || req.headers?.["x-forwarded-for"] || "-");
+      console.log(
+        `[request] POST /v1/chat/completions model=${targetModel} stream=${Boolean(body.stream)} from=${reqClient}`
+      );
+      res.once("finish", () => {
+        console.log(
+          `[request] ${targetModel} -> ${res.statusCode} in ${Date.now() - reqStartAt}ms` +
+            (res.statusCode === 429 && res.getHeader("Retry-After")
+              ? ` (retry-after ${res.getHeader("Retry-After")}s)`
+              : "")
+        );
+      });
 
       // Free tier only: this bridge sends `Authorization: Bearer public` and
       // cannot authenticate anything else, so a model the catalog prices above
