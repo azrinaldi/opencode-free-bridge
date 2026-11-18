@@ -215,7 +215,14 @@ function describe() {
  * case: "direct" already leaves through WARP.
  */
 async function probeExitIp(probeUrl, timeoutMs = PROBE_TIMEOUT_MS, egressUrl = null) {
-  const init = { signal: AbortSignal.timeout(timeoutMs) };
+  // Bun/undici can reuse an existing connection after a hop, which makes the
+  // probe report the pre-hop IP and the rotator think the hop failed. Force a
+  // fresh connection and bypass caches on every probe so `changed` reflects
+  // the new tunnel address.
+  const init = {
+    signal: AbortSignal.timeout(timeoutMs),
+    headers: { "Connection": "close", "Cache-Control": "no-cache", "Pragma": "no-cache" },
+  };
   let res;
   try {
     if (egressUrl) {

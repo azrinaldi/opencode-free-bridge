@@ -1,4 +1,10 @@
 # Changelog
+## [2.7.3] — 2026-11-18
+
+### Fixed
+
+- The IP probe now sends `Connection: close` and cache-bypass headers. Bun/undici could reuse a connection opened before a WARP hop, so the probe reported the old IP and the rotator aborted with "IP tidak berubah sebelum tenggat" even though the tunnel address had changed.
+
 ## [2.7.2] — 2026-11-17
 
 ### Changed
