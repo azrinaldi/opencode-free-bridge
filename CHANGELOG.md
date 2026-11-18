@@ -1,4 +1,10 @@
 # Changelog
+## [2.7.5] — 2026-11-18
+
+### Changed
+
+- `QUOTA_MAX_ROTATIONS` default raised from 3 to 5 after live testing showed three hops sometimes cannot find a WARP address with remaining allowance. Still far below the old 10-hop default.
+
 ## [2.7.4] — 2026-11-18
 
 ### Changed

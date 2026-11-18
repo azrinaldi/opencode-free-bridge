@@ -246,7 +246,7 @@ let rotationIneffectiveRuns = 0;
 // helped. Operators can still raise both limits through env when they have a
 // genuinely independent egress pool.
 const QUOTA_PLAIN_RETRIES = Math.max(0, Math.min(10, parseInt(process.env.QUOTA_PLAIN_RETRIES || "1", 10)));
-const QUOTA_MAX_ROTATIONS = Math.max(0, Math.min(50, parseInt(process.env.QUOTA_MAX_ROTATIONS || "3", 10)));
+const QUOTA_MAX_ROTATIONS = Math.max(0, Math.min(50, parseInt(process.env.QUOTA_MAX_ROTATIONS || "5", 10)));
 const QUOTA_RETRY_DELAY_MS = Math.max(0, Math.min(60000, parseInt(process.env.QUOTA_RETRY_DELAY_MS || "1500", 10)));
 const QUOTA_ROTATION_SETTLE_MS = Math.max(0, Math.min(60000, parseInt(process.env.QUOTA_ROTATION_SETTLE_MS || "6000", 10)));
 let quotaRecoveryStats = { attempts: 0, rotations: 0, exhausted: 0 };
