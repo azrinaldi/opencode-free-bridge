@@ -241,11 +241,23 @@ let rotationIneffectiveRuns = 0;
 //   3. if all M hops still end in 429, answer with an explicit exhaustion error.
 // Keeping the counts here (not scattered in the handler) makes the cap
 // observable in /health and keeps one client request from hopping forever.
-const QUOTA_PLAIN_RETRIES = Math.max(0, Math.min(10, parseInt(process.env.QUOTA_PLAIN_RETRIES || "3", 10)));
-const QUOTA_MAX_ROTATIONS = Math.max(1, Math.min(50, parseInt(process.env.QUOTA_MAX_ROTATIONS || "10", 10)));
+// Conservative defaults. A 429 is usually a spent allowance, not a transient
+// refusal; the old 3 retries + 10 hops burned the allowance faster than it
+// helped. Operators can still raise both limits through env when they have a
+// genuinely independent egress pool.
+const QUOTA_PLAIN_RETRIES = Math.max(0, Math.min(10, parseInt(process.env.QUOTA_PLAIN_RETRIES || "1", 10)));
+const QUOTA_MAX_ROTATIONS = Math.max(0, Math.min(50, parseInt(process.env.QUOTA_MAX_ROTATIONS || "3", 10)));
 const QUOTA_RETRY_DELAY_MS = Math.max(0, Math.min(60000, parseInt(process.env.QUOTA_RETRY_DELAY_MS || "1500", 10)));
-const QUOTA_ROTATION_SETTLE_MS = Math.max(0, Math.min(60000, parseInt(process.env.QUOTA_ROTATION_SETTLE_MS || "12000", 10)));
+const QUOTA_ROTATION_SETTLE_MS = Math.max(0, Math.min(60000, parseInt(process.env.QUOTA_ROTATION_SETTLE_MS || "6000", 10)));
 let quotaRecoveryStats = { attempts: 0, rotations: 0, exhausted: 0 };
+// Last 20 quota refusals, for correlating 429s with model/session/egress.
+// Sessions are hashed: the raw id is a credential-equivalent identifier.
+const QUOTA_EVENT_LIMIT = 20;
+let quotaEvents = [];
+function recordQuotaEvent(fields) {
+  quotaEvents.push({ at: Date.now(), ...fields });
+  if (quotaEvents.length > QUOTA_EVENT_LIMIT) quotaEvents.shift();
+}
 
 /**
  * Test seam: adjust the recovery policy without restarting the process.
@@ -254,7 +266,7 @@ let quotaRecoveryStats = { attempts: 0, rotations: 0, exhausted: 0 };
  */
 function __setQuotaPolicy({ plainRetries, maxRotations, retryDelayMs, rotationSettleMs } = {}) {
   if (Number.isInteger(plainRetries)) quotaPlainRetries = Math.max(0, Math.min(10, plainRetries));
-  if (Number.isInteger(maxRotations)) quotaMaxRotations = Math.max(1, Math.min(50, maxRotations));
+  if (Number.isInteger(maxRotations)) quotaMaxRotations = Math.max(0, Math.min(50, maxRotations));
   if (Number.isInteger(retryDelayMs)) quotaRetryDelayMs = Math.max(0, Math.min(60000, retryDelayMs));
   if (Number.isInteger(rotationSettleMs)) quotaRotationSettleMs = Math.max(0, Math.min(60000, rotationSettleMs));
 }
@@ -2544,6 +2556,7 @@ function handleRequest(req, res) {
               plainRetries: quotaPlainRetries,
               maxRotations: quotaMaxRotations,
               ...quotaRecoveryStats,
+              events: quotaEvents,
             },
           },
           // Per-egress wire traffic and token accounting (usage.json). The
@@ -3107,6 +3120,17 @@ function handleRequest(req, res) {
           let rotationsUsed = 0;
           let exhausted = false;
           quotaRecoveryStats.attempts += 1;
+          const sessionHash = crypto.createHash("sha256").update(String(sessionId)).digest("hex").slice(0, 12);
+          const egressHost = egressState.egressUrl
+            ? String(egressState.egressUrl).replace(/^https?:\/\//, "").split("/")[0]
+            : (egressState.egress?.label || "direct");
+          recordQuotaEvent({
+            model: body.model,
+            session: sessionHash,
+            egress: egressHost,
+            retryAfterMs: retryAfterMs(upstreamRes) ?? null,
+            outcome: "started",
+          });
 
           const isRetryableQuotaTransport = (err) =>
             err?.code === "ECONNRESET" || err?.code === "ECONNREFUSED" ||
@@ -3236,6 +3260,7 @@ function handleRequest(req, res) {
               proxy.markSuccess(egressState.egressUrl);
               rotationIneffectiveRuns = 0;
               console.warn(`[opencode-free-bridge] 429 cleared after ${rotationsUsed} rotation(s); upstream accepted the retry`);
+              recordQuotaEvent({ model: body.model, session: sessionHash, egress: egressHost, rotations: rotationsUsed, outcome: "cleared" });
               break;
             }
             if (!isQuota429(upstreamRes, consumedErrorText)) break;
@@ -3252,6 +3277,7 @@ function handleRequest(req, res) {
           if (exhausted) {
             quotaRecoveryStats.exhausted += 1;
             const retryAfter = retryAfterMs(upstreamRes);
+            recordQuotaEvent({ model: body.model, session: sessionHash, egress: egressHost, retries: quotaPlainRetries, rotations: rotationsUsed, retryAfterMs: retryAfter ?? null, outcome: "exhausted" });
             if (!res.headersSent) {
               res.writeHead(429, {
                 "Content-Type": "application/json",

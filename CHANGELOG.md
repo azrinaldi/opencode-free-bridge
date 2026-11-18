@@ -1,4 +1,11 @@
 # Changelog
+## [2.7.4] — 2026-11-18
+
+### Changed
+
+- Quota 429 recovery is deliberately conservative by default: 1 same-egress retry, at most 3 rotations, and a 6s tunnel settle window. Live A/B testing showed a spent WARP address needs 1-3 hops to find one with allowance, while extra retries only prolonged the request.
+- `/health` → `egress.rotator.quotaRecovery.events` now records the last 20 quota refusals with model, hashed session, egress, `Retry-After`, and outcome. Raw session IDs are never exposed.
+
 ## [2.7.3] — 2026-11-18
 
 ### Fixed

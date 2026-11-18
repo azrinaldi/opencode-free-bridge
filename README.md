@@ -518,10 +518,10 @@ Before running the 4 live drills, `gate-drill.js` sends a single CLI-shaped cont
 | `PANEL_ALLOWED_HOSTS` | _(unset)_ | Extra `Host` names the panel and `/api/proxy` accept (comma-separated), for a reverse proxy in front of the bridge. Loopback names and the configured `HOST` are always accepted |
 | `WARP_ROTATE_CMD` | _(unset)_ | Command run once on a quota 429 (`FreeUsageLimitError`; capacity 429s pass through) to change the egress IP (WARP reconnect / hop CLI). When set it wins over the panel and locks runtime edits. See [Reactive egress rotation](#reactive-egress-rotation-warp-hop-on-429) |
 | `ROTATION_INEFFECTIVE_LIMIT` | `3` | Consecutive quota-429 rotations whose fresh address is refused again before the reactive rotator parks itself (answers 429 without hopping). A manual rotation resets the counter. |
-| `QUOTA_PLAIN_RETRIES` | `3` | Retries of a quota 429 on the same egress before the bridge considers rotating. A single upstream 429 is often transient; no hop is spent here. |
-| `QUOTA_MAX_ROTATIONS` | `10` | Maximum egress rotations in one request after the plain retries are exhausted. After this cap the client gets an explicit `quota_recovery_exhausted` error. |
+| `QUOTA_PLAIN_RETRIES` | `1` | Retries of a quota 429 on the same egress before the bridge considers rotating. Conservative default: a spent allowance rarely clears on a second dial, and each retry costs time. |
+| `QUOTA_MAX_ROTATIONS` | `3` | Maximum egress rotations in one request after the plain retries are exhausted. After this cap the client gets an explicit `quota_recovery_exhausted` error. Raise only with an independent egress pool. |
 | `QUOTA_RETRY_DELAY_MS` | `1500` | Wait between plain retries on the same IP. |
-| `QUOTA_ROTATION_SETTLE_MS` | `12000` | Wait for the WARP tunnel to report Connected/healthy after a hop before resending; this avoids the `ECONNRESET` of a dial during the disconnect window. |
+| `QUOTA_ROTATION_SETTLE_MS` | `6000` | Wait for the WARP tunnel to report Connected/healthy after a hop before resending; this avoids the `ECONNRESET` of a dial during the disconnect window. |
 | `LOG_BUFFER_LINES` | `500` | Size of the in-memory log ring buffer served to the panel's Log bridge tab (`/api/logs`). Oldest lines fall off; the full history remains with the service manager (journald, docker logs, or the foreground terminal). |
 | `WARP_ROTATE_TIMEOUT_MS` | `45000` | Whole-rotation deadline: command run + exit-IP polling. The original 429 passes through when the IP has not changed by then |
 | `WARP_ROTATE_COOLDOWN_MS` | `75000` | Minimum gap between two rotations (manual or reactive), protecting the tunnel from hop storms |
