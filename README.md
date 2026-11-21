@@ -1052,6 +1052,30 @@ as `run_program` and restores the client's name on the way back, including
 streamed tool-call deltas, `tool_choice` and tool-result turns, so a client keeps
 its own tool name.
 
+### `429 FreeUsageLimitError` from a blocked parameter name
+
+The same quota wording hides a second, deeper filter: it also inspects the
+**property names** inside `tools[].function.parameters.properties`. Measured
+on 2026-11-21 with one model, one gateway and one egress, in the same minute the
+official CLI answered `200`:
+
+| `edit` schema | result |
+|---|---|
+| `old_string` / `new_string` (snake_case) | `429` |
+| `old_text` / `new_text` | `200` |
+| `oldString` / `newString` (camelCase) | `200` |
+| original description, simplified schema | `200` |
+| empty description, original schema | `429` |
+
+So the rule is on the key, not the tool name, the description or the byte size.
+It matters because omp, Cline, Roo and Aider declare `edit` with
+`old_string`/`new_string`, while the OpenCode CLI uses `oldString`/`newString`
+— which is why the CLI keeps working from the same IP. The bridge now sends
+those keys as `old_text`/`new_text` and puts the client's names back into
+`tool_calls[].function.arguments`, both in streamed SSE (arguments are buffered
+per tool-call index because a JSON key can straddle two chunks) and in the
+folded JSON response, on both the Chat Completions and Responses lanes.
+
 The bridge has appended the block since the fix in this release: it derives the
 working directory, workspace root, git-repo flag and platform from its own
 process. A client that already forwards the CLI's prompt keeps its own block

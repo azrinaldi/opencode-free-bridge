@@ -14,6 +14,8 @@ const {
   markProtocolSupport,
   prepareToolsWithFingerprint,
   restoreClientToolName,
+  restoreClientToolArguments,
+  restoreToolCallArguments,
   buildUpstreamHeaders,
   buildUpstreamPayload,
   getPersistentSessionId,
@@ -376,6 +378,83 @@ describe("server unit & integration tests", () => {
     assert.equal(both.aliasToOriginal.get("run_program2"), "run_code");
   });
 
+  it("renames gate-refused edit parameters and restores the client's names on arguments", () => {
+    // Measured on 2026-11-21: the official CLI answers 200 from the same IP and
+    // minute while a request carrying an `edit` schema with `old_string` /
+    // `new_string` answers 429 FreeUsageLimitError. The gate reads only the
+    // property name — the description is not scanned — so the bridge changes
+    // the key, keeps the description, and maps arguments back on the way in.
+    const editTool = {
+      type: "function",
+      function: {
+        name: "edit",
+        description: "Replaces the exact text in `old_string` with `new_string`.",
+        parameters: {
+          type: "object",
+          properties: {
+            old_string: { type: "string" },
+            new_string: { type: "string" },
+            path: { type: "string" },
+          },
+          required: ["old_string", "new_string", "path"],
+          additionalProperties: false,
+        },
+      },
+    };
+
+    const chat = prepareToolsWithFingerprint([editTool], false);
+    const edit = chat.tools.find((t) => t.function.name === "edit");
+    const props = Object.keys(edit.function.parameters.properties);
+    assert.deepEqual(props, ["old_text", "new_text", "path"]);
+    assert.deepEqual(edit.function.parameters.required, ["old_text", "new_text", "path"]);
+    assert.equal(edit.function.description, editTool.function.description);
+    assert.equal(chat.paramAliases.get("edit").get("old_text"), "old_string");
+    assert.equal(chat.paramAliases.get("edit").get("new_text"), "new_string");
+    assert.equal(/"old_string"|"new_string"/.test(JSON.stringify(chat.tools)), false);
+
+    const responses = prepareToolsWithFingerprint([editTool], true);
+    const flatEdit = responses.tools.find((t) => t.name === "edit");
+    assert.deepEqual(Object.keys(flatEdit.parameters.properties), [
+      "old_text",
+      "new_text",
+      "path",
+    ]);
+
+    const aliases = chat.paramAliases.get("edit");
+    assert.equal(
+      restoreClientToolArguments('{"old_text":"a","new_text":"b","path":"c"}', aliases),
+      '{"old_string":"a","new_string":"b","path":"c"}'
+    );
+    // The model may follow the description's camelCase spelling. It still has
+    // to come back as the client's key.
+    assert.equal(
+      restoreClientToolArguments('{"oldString":"a","newString":"b"}', aliases),
+      '{"old_string":"a","new_string":"b"}'
+    );
+    // If both spellings are emitted, the alias from the schema wins over the
+    // spelling mentioned in the description.
+    assert.equal(
+      restoreClientToolArguments('{"old_text":"a","oldString":"b"}', aliases),
+      '{"old_string":"a"}'
+    );
+    // A call whose name was itself aliased resolves through originalToAlias.
+    const call = {
+      function: { name: "run_code", arguments: '{"old_text":"a"}' },
+    };
+    const both = prepareToolsWithFingerprint(
+      [{ ...editTool, function: { ...editTool.function, name: "run_code" } }],
+      false
+    );
+    restoreToolCallArguments(call, both.paramAliases, both.originalToAlias);
+    assert.equal(call.function.arguments, '{"old_string":"a"}');
+    // Unrelated keys and malformed JSON pass through untouched.
+    assert.equal(
+      restoreClientToolArguments('{"path":"a","other":"b"}', aliases),
+      '{"path":"a","other":"b"}'
+    );
+    assert.equal(restoreClientToolArguments("not json", aliases), "not json");
+  });
+
   it("generates 10,000 session IDs using pooled random bytes in <25ms", () => {
     const t0 = process.hrtime.bigint();
     for (let i = 0; i < 10_000; i++) {
@@ -540,6 +619,143 @@ describe("server unit & integration tests", () => {
       assert.equal(truncRes.status, 200);
       assert.equal(truncRes.body.choices[0].finish_reason, "length");
       assert.equal(truncRes.body.choices[0].message.content, "truncated");
+    });
+
+    it("restores renamed edit parameters in streamed and non-streamed tool calls", async () => {
+      // A schema-level rename is only half the patch: the model writes the
+      // renamed keys into its tool call, so both the SSE lane and the folded
+      // JSON lane have to put the client's names back before answering.
+      const editTool = {
+        type: "function",
+        function: {
+          name: "edit",
+          description: "Replaces `old_string` with `new_string`.",
+          parameters: {
+            type: "object",
+            properties: {
+              old_string: { type: "string" },
+              new_string: { type: "string" },
+              path: { type: "string" },
+            },
+            required: ["old_string", "new_string", "path"],
+          },
+        },
+      };
+      const line = (obj) => `data: ${JSON.stringify(obj)}\n\n`;
+      const chunk = (delta, finish_reason = null) => ({
+        id: "1",
+        object: "chat.completion.chunk",
+        created: 1,
+        model: "big-pickle",
+        choices: [{ index: 0, delta, finish_reason }],
+      });
+      const chatLines = [
+        line(
+          chunk({
+            tool_calls: [
+              {
+                index: 0,
+                id: "call_1",
+                type: "function",
+                function: { name: "edit", arguments: "" },
+              },
+            ],
+          })
+        ),
+        line(chunk({ tool_calls: [{ index: 0, function: { arguments: '{"path":"a.txt","old_st' } }] })),
+        line(chunk({ tool_calls: [{ index: 0, function: { arguments: 'ring":"x","new_string":"y"}' } }] })),
+        line(chunk({}, "tool_calls")),
+        "data: [DONE]\n\n",
+      ];
+      let capturedBody = null;
+      mockFetchImpl = async (_url, init) => {
+        capturedBody = JSON.parse(init.body);
+        return { ok: true, status: 200, body: sseStreamFromLines(chatLines) };
+      };
+
+      const payload = (stream) => ({
+        model: "big-pickle",
+        stream,
+        messages: [{ role: "user", content: "edit a.txt" }],
+        tools: [editTool],
+      });
+
+      const streamed = await httpRequest(port, "POST", "/v1/chat/completions", payload(true));
+      assert.equal(streamed.status, 200);
+      assert.equal(/"old_string"|"new_string"/.test(JSON.stringify(capturedBody.tools)), false);
+      assert.ok(capturedBody.tools.some((t) => t.function?.parameters?.properties?.old_text));
+
+      const events = streamed.raw
+        .split("\n\n")
+        .filter((l) => l.startsWith("data: ") && l !== "data: [DONE]")
+        .map((l) => JSON.parse(l.slice(6)));
+      const argEvents = events.filter((ev) =>
+        ev.choices?.[0]?.delta?.tool_calls?.some(
+          (tc) => typeof tc.function?.arguments === "string" && tc.function.arguments
+        )
+      );
+      assert.equal(argEvents.length, 1, "split arguments are emitted as one restored chunk");
+      assert.deepEqual(
+        JSON.parse(argEvents[0].choices[0].delta.tool_calls[0].function.arguments),
+        { path: "a.txt", old_string: "x", new_string: "y" }
+      );
+      assert.ok(
+        events.indexOf(argEvents[0]) < events.findIndex((ev) => ev.choices?.[0]?.finish_reason),
+        "restored arguments arrive before the finish chunk"
+      );
+
+      const folded = await httpRequest(port, "POST", "/v1/chat/completions", payload(false));
+      assert.equal(folded.status, 200);
+      const foldedCall = folded.body.choices[0].message.tool_calls[0];
+      assert.equal(foldedCall.function.name, "edit");
+      assert.deepEqual(JSON.parse(foldedCall.function.arguments), {
+        path: "a.txt",
+        old_string: "x",
+        new_string: "y",
+      });
+
+      // Responses lane: argument fragments travel as `function_call_arguments.delta`.
+      srv_markProtocolSupport("big-pickle", true);
+      mockFetchImpl = async () => ({
+        ok: true,
+        status: 200,
+        body: sseStreamFromLines([
+          line({
+            type: "response.output_item.added",
+            output_index: 0,
+            item: { id: "fc_1", call_id: "call_r", type: "function_call", name: "edit" },
+          }),
+          line({
+            type: "response.function_call_arguments.delta",
+            output_index: 0,
+            delta: '{"old_st',
+          }),
+          line({
+            type: "response.function_call_arguments.delta",
+            output_index: 0,
+            delta: 'ring":"x","new_string":"y"}',
+          }),
+          line({
+            type: "response.completed",
+            response: {
+              status: "completed",
+              usage: { input_tokens: 10, output_tokens: 5, total_tokens: 15 },
+            },
+          }),
+        ]),
+      });
+      const responses = await httpRequest(port, "POST", "/v1/chat/completions", payload(true));
+      assert.equal(responses.status, 200);
+      const respEvents = responses.raw
+        .split("\n\n")
+        .filter((l) => l.startsWith("data: ") && l !== "data: [DONE]")
+        .map((l) => JSON.parse(l.slice(6)));
+      const respArgs = respEvents
+        .flatMap((ev) => ev.choices?.[0]?.delta?.tool_calls || [])
+        .map((tc) => tc.function?.arguments)
+        .filter((a) => typeof a === "string" && a);
+      assert.equal(respArgs.length, 1);
+      assert.deepEqual(JSON.parse(respArgs[0]), { old_string: "x", new_string: "y" });
     });
 
     it("automatically retries on the opposite protocol lane when upstream returns ModelProtocolUnsupported", async () => {

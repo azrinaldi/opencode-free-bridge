@@ -1195,6 +1195,142 @@ function isBlockedToolName(name) {
   return BLOCKED_TOOL_NAME_PATTERNS.some((pattern) => pattern.test(name));
 }
 
+// Client tool *parameter* names upstream refuses. Measured on 2026-11-21
+// against the live gateway, on the same egress and minute the official CLI was
+// answering 200: a tool whose `parameters.properties` carries `old_string` or
+// `new_string` — the edit schema omp, Cline, Roo and Aider use — answers
+// `429 FreeUsageLimitError`, while the identical tool with `old_text`,
+// `oldText`, `oldString` or any other key answers 200. Only the key is
+// inspected: the same tool with its description intact and a simplified schema
+// passes, and an empty description with the original schema still fails. Like
+// the `run_code` name filter this wears the quota wording, so it reads as a
+// spent allowance. `prepareToolParameters` renames such a key on the way out and
+// `restoreClientToolArguments` puts the client's spelling back on the way in.
+const BLOCKED_TOOL_PARAM_ALIASES = new Map([
+  ["old_string", "old_text"],
+  ["new_string", "new_text"],
+]);
+
+/**
+ * Rename the client parameter keys the gate refuses, keeping a map back to the
+ * client's spelling. Returns `aliases: null` when nothing was renamed, so the
+ * common case allocates nothing and the response path stays on its fast path.
+ */
+function prepareToolParameters(parameters) {
+  if (!parameters || typeof parameters !== "object") return { parameters, aliases: null };
+  const properties = parameters.properties;
+  if (!properties || typeof properties !== "object" || Array.isArray(properties)) {
+    return { parameters, aliases: null };
+  }
+  const keys = Object.keys(properties);
+  if (!keys.some((key) => BLOCKED_TOOL_PARAM_ALIASES.has(key))) {
+    return { parameters, aliases: null };
+  }
+
+  const aliases = new Map();
+  const renamed = {};
+  const taken = new Set(keys);
+  for (const key of keys) {
+    const base = BLOCKED_TOOL_PARAM_ALIASES.get(key);
+    if (!base) {
+      renamed[key] = properties[key];
+      continue;
+    }
+    let alias = base;
+    for (let i = 2; taken.has(alias); i++) alias = `${base}${i}`;
+    taken.add(alias);
+    aliases.set(alias, key);
+    renamed[alias] = properties[key];
+  }
+
+  const next = { ...parameters, properties: renamed };
+  if (Array.isArray(parameters.required)) {
+    next.required = parameters.required.map((key) => {
+      for (const [alias, original] of aliases) {
+        if (original === key) return alias;
+      }
+      return key;
+    });
+  }
+  return { parameters: next, aliases };
+}
+
+const normalizeParamKey = (key) => String(key).toLowerCase().replace(/[^a-z0-9]/g, "");
+
+/**
+ * Put the client's parameter names back into a tool call's arguments.
+ *
+ * The model is shown `old_text` but the client's schema says `old_string`, and
+ * the model may follow either the schema or the description's `oldString`
+ * wording, so every key that normalizes to the client's name is rewritten.
+ * Only top-level keys are touched: that is where schema properties live, and
+ * recursing would rewrite values that merely look like a property name.
+ */
+function restoreClientToolArguments(argsJson, aliases) {
+  if (typeof argsJson !== "string" || !argsJson || !aliases || aliases.size === 0) return argsJson;
+  let parsed;
+  try {
+    parsed = JSON.parse(argsJson);
+  } catch {
+    return argsJson;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return argsJson;
+
+  const wireAliases = new Set(aliases.keys());
+  const lookup = new Map();
+  for (const [alias, original] of aliases) {
+    lookup.set(normalizeParamKey(alias), original);
+  }
+  for (const [alias, original] of aliases) {
+    const key = normalizeParamKey(original);
+    if (!lookup.has(key)) lookup.set(key, original);
+  }
+
+  // The model can emit both `old_text` (the alias in the schema) and
+  // `oldString` (the spelling in the description). They normalize to one
+  // client key, so prefer the exact alias rather than letting whichever came
+  // last win.
+  const best = new Map();
+  for (const [key, value] of Object.entries(parsed)) {
+    const original = lookup.get(normalizeParamKey(key));
+    const target = original || key;
+    const priority = wireAliases.has(key) || key === original ? 2 : 1;
+    const current = best.get(target);
+    if (!current || priority > current.priority) best.set(target, { value, priority });
+  }
+
+  let changed = false;
+  const out = {};
+  const seen = new Set();
+  for (const key of Object.keys(parsed)) {
+    const original = lookup.get(normalizeParamKey(key));
+    const target = original || key;
+    if (seen.has(target)) continue;
+    seen.add(target);
+    out[target] = best.get(target).value;
+    if (target !== key) changed = true;
+  }
+  return changed ? JSON.stringify(out) : argsJson;
+}
+
+/**
+ * The parameter map for a tool call whose `function.name` is already the
+ * client's spelling. `originalToAlias` carries the wire name the request used.
+ */
+function paramAliasesForToolName(name, paramAliases, originalToAlias) {
+  if (!paramAliases || paramAliases.size === 0) return null;
+  const wireName = (originalToAlias && originalToAlias.get(name)) || name;
+  return paramAliases.get(wireName) || null;
+}
+
+function restoreToolCallArguments(toolCall, paramAliases, originalToAlias) {
+  const fn = toolCall && toolCall.function;
+  if (!fn || typeof fn.arguments !== "string" || !fn.arguments) return toolCall;
+  const aliases = paramAliasesForToolName(fn.name, paramAliases, originalToAlias);
+  if (aliases) fn.arguments = restoreClientToolArguments(fn.arguments, aliases);
+  return toolCall;
+}
+
 /**
  * Merge the client's tools with the fingerprint tools the gate requires.
  *
@@ -1221,14 +1357,36 @@ function prepareToolsWithFingerprint(clientTools = [], flat = false, scope = nul
       placeholderNote: buildPlaceholderNote(fingerprintNames),
       aliasToOriginal: EMPTY_MAP,
       originalToAlias: EMPTY_MAP,
+      paramAliases: EMPTY_MAP,
     };
   }
 
   const aliasToOriginal = new Map();
   const originalToAlias = new Map();
+  // Wire tool name -> Map(parameter alias -> client's parameter name)
+  const paramAliases = new Map();
   const normalized = [];
   const takenNames = new Set(clientTools.map(getToolName).filter(Boolean));
   const presentExactFingerprints = new Set();
+
+  const pushTool = (wireName, description, parameters, extra) => {
+    const prepared = prepareToolParameters(parameters);
+    if (prepared.aliases) paramAliases.set(wireName, prepared.aliases);
+    normalized.push(
+      flat
+        ? {
+            type: "function",
+            name: wireName,
+            description,
+            parameters: prepared.parameters,
+            ...extra,
+          }
+        : {
+            type: "function",
+            function: { name: wireName, description, parameters: prepared.parameters },
+          }
+    );
+  };
 
   for (const t of clientTools) {
     const name = getToolName(t);
@@ -1245,11 +1403,7 @@ function prepareToolsWithFingerprint(clientTools = [], flat = false, scope = nul
       takenNames.add(alias);
       aliasToOriginal.set(alias, name);
       originalToAlias.set(name, alias);
-      normalized.push(
-        flat
-          ? { type: "function", name: alias, description, parameters }
-          : { type: "function", function: { name: alias, description, parameters } }
-      );
+      pushTool(alias, description, parameters);
       continue;
     }
 
@@ -1257,11 +1411,7 @@ function prepareToolsWithFingerprint(clientTools = [], flat = false, scope = nul
       if (presentExactFingerprints.has(name)) continue;
       if (isExactFingerprintDef(t, name)) {
         presentExactFingerprints.add(name);
-        normalized.push(
-          flat
-            ? { type: "function", name, description, parameters, strict: false }
-            : { type: "function", function: { name, description, parameters } }
-        );
+        pushTool(name, description, parameters, flat ? { strict: false } : undefined);
         continue;
       }
       // Client defined its own tool under a name the gate fingerprints: alias
@@ -1274,19 +1424,11 @@ function prepareToolsWithFingerprint(clientTools = [], flat = false, scope = nul
       takenNames.add(alias);
       aliasToOriginal.set(alias, name);
       originalToAlias.set(name, alias);
-      normalized.push(
-        flat
-          ? { type: "function", name: alias, description, parameters }
-          : { type: "function", function: { name: alias, description, parameters } }
-      );
+      pushTool(alias, description, parameters);
       continue;
     }
 
-    normalized.push(
-      flat
-        ? { type: "function", name, description, parameters }
-        : { type: "function", function: { name, description, parameters } }
-    );
+    pushTool(name, description, parameters);
   }
 
   const appended = [];
@@ -1307,6 +1449,7 @@ function prepareToolsWithFingerprint(clientTools = [], flat = false, scope = nul
         : buildPlaceholderNote(appended),
     aliasToOriginal,
     originalToAlias,
+    paramAliases,
   };
 }
 
@@ -1602,12 +1745,8 @@ function buildUpstreamPayload(body, targetModel, useResponses, scope = null) {
   const requestedTokens =
     body.max_output_tokens ?? body.max_completion_tokens ?? body.max_tokens;
   const maxTokens = effectiveMaxTokens(requestedTokens, targetModel, body);
-  const { tools, placeholderNote, aliasToOriginal, originalToAlias } = prepareToolsWithFingerprint(
-    body.tools,
-    useResponses,
-    scope,
-    targetModel
-  );
+  const { tools, placeholderNote, aliasToOriginal, originalToAlias, paramAliases } =
+    prepareToolsWithFingerprint(body.tools, useResponses, scope, targetModel);
   if (useResponses) {
     const upstreamBody = {
       model: targetModel,
@@ -1627,7 +1766,7 @@ function buildUpstreamPayload(body, targetModel, useResponses, scope = null) {
     }
     if (typeof body.temperature === "number") upstreamBody.temperature = body.temperature;
     if (typeof body.top_p === "number") upstreamBody.top_p = body.top_p;
-    return { upstreamBody, aliasToOriginal };
+    return { upstreamBody, aliasToOriginal, originalToAlias, paramAliases };
   }
 
   // Field names and order match the CLI's own request: `max_completion_tokens`
@@ -1668,7 +1807,7 @@ function buildUpstreamPayload(body, targetModel, useResponses, scope = null) {
     }
   }
 
-  return { upstreamBody, aliasToOriginal };
+  return { upstreamBody, aliasToOriginal, originalToAlias, paramAliases };
 }
 
 /**
@@ -2821,7 +2960,11 @@ function handleRequest(req, res) {
 
       let reader = null;
       try {
-        let { upstreamBody, aliasToOriginal } = buildUpstreamPayload(body, targetModel, useResponses);
+        let { upstreamBody, aliasToOriginal, originalToAlias, paramAliases } = buildUpstreamPayload(
+          body,
+          targetModel,
+          useResponses
+        );
         let liveEndpoints = resolveEndpoints(targetModel);
         let upstreamUrl = useResponses ? liveEndpoints.responsesUrl : liveEndpoints.chatUrl;
 
@@ -2879,7 +3022,11 @@ function handleRequest(req, res) {
           ) {
             useResponses = !useResponses;
             markProtocolSupport(targetModel, useResponses);
-            ({ upstreamBody, aliasToOriginal } = buildUpstreamPayload(body, targetModel, useResponses));
+            ({ upstreamBody, aliasToOriginal, originalToAlias, paramAliases } = buildUpstreamPayload(
+              body,
+              targetModel,
+              useResponses
+            ));
             upstreamUrl = useResponses ? liveEndpoints.responsesUrl : liveEndpoints.chatUrl;
             upstreamRes = await upstreamFetch(upstreamUrl, {
               method: "POST",
@@ -3473,7 +3620,7 @@ function handleRequest(req, res) {
             console.warn(
               `[opencode-free-bridge] Upstream CLI gate rejected request (${gateStatus}, ${verdict.reason || "unknown"}); refreshing identity and retrying once with full tool set`
             );
-            ({ upstreamBody, aliasToOriginal } = buildUpstreamPayload(
+            ({ upstreamBody, aliasToOriginal, originalToAlias, paramAliases } = buildUpstreamPayload(
               body,
               targetModel,
               useResponses,
@@ -3714,6 +3861,37 @@ function handleRequest(req, res) {
             let upstreamFinishReason = null;
             let streamUsage = null;
             let streamAbortedByError = false;
+            const hasParamAliases = paramAliases.size > 0;
+            // Same reason as the chat lane: a renamed parameter key spans several
+            // argument fragments, so those fragments are accumulated per tool index
+            // and emitted once, restored, before the finish chunk.
+            const wireNameByToolIndex = new Map();
+            const bufferedToolArgs = new Map();
+            const flushBufferedToolArgs = () => {
+              if (bufferedToolArgs.size === 0) return;
+              for (const [idx, rawArgs] of bufferedToolArgs) {
+                const args = restoreClientToolArguments(
+                  rawArgs,
+                  paramAliases.get(wireNameByToolIndex.get(idx))
+                );
+                writeSse(
+                  `data: ${JSON.stringify({
+                    id: completionId,
+                    object: "chat.completion.chunk",
+                    created,
+                    model: targetModel,
+                    choices: [
+                      {
+                        index: 0,
+                        delta: { tool_calls: [{ index: idx, function: { arguments: args } }] },
+                        finish_reason: null,
+                      },
+                    ],
+                  })}\n\n`
+                );
+              }
+              bufferedToolArgs.clear();
+            };
 
             const handleResponsesStreamLine = (line) => {
               if (streamAbortedByError) return;
@@ -3768,6 +3946,7 @@ function handleRequest(req, res) {
                     if (ev.output_index !== undefined) toolIndexMap.set(String(ev.output_index), toolIdx);
                   }
                   const restoredName = restoreClientToolName(ev.item.name, aliasToOriginal);
+                  wireNameByToolIndex.set(toolIdx, ev.item.name);
                   writeSse(
                     `data: ${JSON.stringify({
                       id: completionId,
@@ -3795,6 +3974,13 @@ function handleRequest(req, res) {
                 } else if (ev.type === "response.function_call_arguments.delta" && ev.delta) {
                   const key = ev.output_index !== undefined ? String(ev.output_index) : ev.item_id || ev.call_id;
                   const toolIdx = key !== undefined && toolIndexMap.has(key) ? toolIndexMap.get(key) : 0;
+                  if (hasParamAliases && paramAliases.has(wireNameByToolIndex.get(toolIdx))) {
+                    bufferedToolArgs.set(
+                      toolIdx,
+                      (bufferedToolArgs.get(toolIdx) || "") + ev.delta
+                    );
+                    return;
+                  }
                   writeSse(
                     `data: ${JSON.stringify({
                       id: completionId,
@@ -3830,6 +4016,7 @@ function handleRequest(req, res) {
               if (!res.writableEnded) res.end();
               return;
             }
+            flushBufferedToolArgs();
 
             const finalFinishReason = upstreamFinishReason || (hasToolCalls ? "tool_calls" : "stop");
             writeSse(
@@ -3857,14 +4044,46 @@ function handleRequest(req, res) {
             return res.end();
           } else {
             // Chat Completions API SSE stream
-            const hasAliases = aliasToOriginal.size > 0;
+            const hasNameAliases = aliasToOriginal.size > 0;
+            const hasParamAliases = paramAliases.size > 0;
+            const hasAliases = hasNameAliases || hasParamAliases;
             let streamAbortedByError = false;
+            // Arguments for a tool whose parameter keys had to be renamed cannot
+            // be forwarded fragment by fragment: the key being rewritten is split
+            // across chunks. They are accumulated per tool-call index and emitted
+            // as one chunk, still keyed by index, before the finish chunk.
+            const bufferedToolArgs = new Map();
+            const toolWireNameByIndex = new Map();
+            const flushBufferedToolArgs = () => {
+              if (bufferedToolArgs.size === 0) return;
+              for (const [idx, rawArgs] of bufferedToolArgs) {
+                const aliases = paramAliases.get(toolWireNameByIndex.get(idx));
+                const args = restoreClientToolArguments(rawArgs, aliases);
+                writeSse(
+                  `data: ${JSON.stringify({
+                    id: completionId,
+                    object: "chat.completion.chunk",
+                    created,
+                    model: targetModel,
+                    choices: [
+                      {
+                        index: 0,
+                        delta: { tool_calls: [{ index: idx, function: { arguments: args } }] },
+                        finish_reason: null,
+                      },
+                    ],
+                  })}\n\n`
+                );
+              }
+              bufferedToolArgs.clear();
+            };
             const handleChatStreamLine = (line) => {
               if (streamAbortedByError) return;
               if (!line.startsWith("data: ")) return;
               const raw = line.slice(6).trim();
               if (!raw) return;
               if (raw === "[DONE]") {
+                flushBufferedToolArgs();
                 writeSse("data: [DONE]\n\n");
                 return;
               }
@@ -3892,13 +4111,32 @@ function handleRequest(req, res) {
                 if (delta && delta.reasoning && !delta.reasoning_content) {
                   delta.reasoning_content = delta.reasoning;
                 }
-                if (hasAliases && Array.isArray(delta?.tool_calls)) {
+                if (Array.isArray(delta?.tool_calls)) {
                   for (const tc of delta.tool_calls) {
+                    const idx = Number.isFinite(tc.index) ? tc.index : 0;
                     if (tc.function?.name) {
-                      tc.function.name = restoreClientToolName(tc.function.name, aliasToOriginal);
+                      toolWireNameByIndex.set(idx, tc.function.name);
+                      if (hasNameAliases) {
+                        tc.function.name = restoreClientToolName(
+                          tc.function.name,
+                          aliasToOriginal
+                        );
+                      }
+                    }
+                    if (!hasParamAliases) continue;
+                    const aliases = paramAliases.get(toolWireNameByIndex.get(idx));
+                    if (!aliases) continue;
+                    if (typeof tc.function?.arguments === "string" && tc.function.arguments) {
+                      bufferedToolArgs.set(
+                        idx,
+                        (bufferedToolArgs.get(idx) || "") + tc.function.arguments
+                      );
+                      delete tc.function.arguments;
+                      if (Object.keys(tc.function).length === 0) delete tc.function;
                     }
                   }
                 }
+                if (chunk.choices?.[0]?.finish_reason) flushBufferedToolArgs();
                 writeSse(`data: ${JSON.stringify(chunk)}\n\n`);
               } catch {
                 writeSse(`data: ${raw}\n\n`);
@@ -3906,6 +4144,7 @@ function handleRequest(req, res) {
             };
 
             await consumeSseLines(reader, decoder, handleChatStreamLine);
+            flushBufferedToolArgs();
             if (!res.writableEnded) {
               if (!sseHeadersSent) writeSse("data: [DONE]\n\n");
               res.end();
@@ -4050,6 +4289,9 @@ function handleRequest(req, res) {
         }
 
         const validToolCalls = toolCalls.filter(Boolean);
+        for (const tc of validToolCalls) {
+          restoreToolCallArguments(tc, paramAliases, originalToAlias);
+        }
         const messageObj = { role: "assistant", content: assistantText || null };
         if (reasoningText) messageObj.reasoning_content = reasoningText;
         if (validToolCalls.length > 0) messageObj.tool_calls = validToolCalls;
@@ -4304,6 +4546,9 @@ module.exports = {
   prepareResponsesTools,
   prepareChatTools,
   restoreClientToolName,
+  prepareToolParameters,
+  restoreClientToolArguments,
+  restoreToolCallArguments,
   buildUpstreamPayload,
   isNewerVersion,
   checkAndApplyUpdate,
