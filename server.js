@@ -1332,6 +1332,72 @@ function restoreToolCallArguments(toolCall, paramAliases, originalToAlias) {
 }
 
 /**
+ * Invert a wire->client parameter map into client->wire for outbound tool calls.
+ *
+ * The gate inspects argument keys in prior assistant tool calls too, so a client
+ * sending back `old_string`/`new_string` in a follow-up turn must get the same
+ * names the schema was rewritten to. `aliases` is Map(wire -> client).
+ */
+function clientToWireParamMap(aliases) {
+  if (!aliases || aliases.size === 0) return null;
+  const out = new Map();
+  for (const [wire, client] of aliases) out.set(client, wire);
+  return out;
+}
+
+/**
+ * Rewrite one tool call's argument keys from the client's spelling to the wire
+ * alias, before forwarding an assistant message upstream. Returns a new object
+ * so the caller's `body.messages` stays untouched across gateway retries.
+ */
+function prepareToolCallArguments(toolCall, paramAliases, originalToAlias) {
+  const fn = toolCall && toolCall.function;
+  if (!fn || typeof fn.arguments !== "string" || !fn.arguments) return toolCall;
+  const aliases = paramAliasesForToolName(fn.name, paramAliases, originalToAlias);
+  if (!aliases) return toolCall;
+  const clientToWire = clientToWireParamMap(aliases);
+  let parsed;
+  try {
+    parsed = JSON.parse(fn.arguments);
+  } catch {
+    return toolCall;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return toolCall;
+  let changed = false;
+  const out = {};
+  for (const [key, value] of Object.entries(parsed)) {
+    const wire = clientToWire.get(key);
+    if (wire) {
+      out[wire] = value;
+      changed = true;
+    } else {
+      out[key] = value;
+    }
+  }
+  if (!changed) return toolCall;
+  return { ...toolCall, function: { ...fn, arguments: JSON.stringify(out) } };
+}
+
+/**
+ * Prepare every assistant tool call in an outbound message. Returns a new
+ * message only when at least one call needed an alias; otherwise the original
+ * object passes through, keeping the common case allocation-free.
+ */
+function prepareMessageToolCallArguments(m, paramAliases, originalToAlias) {
+  if (!paramAliases || paramAliases.size === 0) return m;
+  if (m?.role !== "assistant" || !Array.isArray(m.tool_calls)) return m;
+  let next = null;
+  for (let i = 0; i < m.tool_calls.length; i++) {
+    const prepared = prepareToolCallArguments(m.tool_calls[i], paramAliases, originalToAlias);
+    if (prepared !== m.tool_calls[i]) {
+      if (!next) next = m.tool_calls.slice();
+      next[i] = prepared;
+    }
+  }
+  return next ? { ...m, tool_calls: next } : m;
+}
+
+/**
  * Merge the client's tools with the fingerprint tools the gate requires.
  *
  * Three cases per required tool:
@@ -1556,7 +1622,7 @@ function transformResponsesContent(content, role = "user") {
 }
 
 // Convert OpenAI messages to OpenCode input format (for Responses API)
-function transformToResponsesInput(messages = [], originalToAlias = null) {
+function transformToResponsesInput(messages = [], originalToAlias = null, paramAliases = null) {
   const input = [];
   for (const m of Array.isArray(messages) ? messages : []) {
     if (!m) continue;
@@ -1578,7 +1644,8 @@ function transformToResponsesInput(messages = [], originalToAlias = null) {
           content: transformResponsesContent(m.content, "assistant"),
         });
       }
-      for (const tc of m.tool_calls) {
+      for (const rawTc of m.tool_calls) {
+        const tc = prepareToolCallArguments(rawTc, paramAliases, originalToAlias);
         const fn = tc.function || {};
         const rawName = fn.name || "unknown";
         const mappedName =
@@ -1675,19 +1742,29 @@ function extractSystemInstructions(messages = [], explicitInstructions = "", pla
   return withHarnessEnvBlock(parts.join("\n\n"));
 }
 
-function transformChatMessages(messages = [], originalToAlias = null, placeholderNote = "") {
+function transformChatMessages(
+  messages = [],
+  originalToAlias = null,
+  placeholderNote = "",
+  paramAliases = null
+) {
   const out = [];
   for (const m of Array.isArray(messages) ? messages : []) {
     if (!m) continue;
+    // The gate inspects argument keys in prior assistant tool calls too, so a
+    // client sending back `old_string` in a follow-up turn must get the wire
+    // alias here just as the tool schema did. Name aliasing and parameter
+    // aliasing are independent: either can apply without the other.
+    const aliased = prepareMessageToolCallArguments(m, paramAliases, originalToAlias);
     if (
       originalToAlias &&
       originalToAlias.size > 0 &&
-      m.role === "assistant" &&
-      Array.isArray(m.tool_calls)
+      aliased.role === "assistant" &&
+      Array.isArray(aliased.tool_calls)
     ) {
       out.push({
-        ...m,
-        tool_calls: m.tool_calls.map((tc) => {
+        ...aliased,
+        tool_calls: aliased.tool_calls.map((tc) => {
           const fnName = tc?.function?.name;
           if (fnName && originalToAlias.has(fnName)) {
             return { ...tc, function: { ...tc.function, name: originalToAlias.get(fnName) } };
@@ -1696,7 +1773,7 @@ function transformChatMessages(messages = [], originalToAlias = null, placeholde
         }),
       });
     } else {
-      out.push(m);
+      out.push(aliased);
     }
   }
 
@@ -1750,7 +1827,7 @@ function buildUpstreamPayload(body, targetModel, useResponses, scope = null) {
   if (useResponses) {
     const upstreamBody = {
       model: targetModel,
-      input: transformToResponsesInput(body.messages, originalToAlias),
+      input: transformToResponsesInput(body.messages, originalToAlias, paramAliases),
       stream: true,
       max_output_tokens: maxTokens,
       tools,
@@ -1775,7 +1852,7 @@ function buildUpstreamPayload(body, targetModel, useResponses, scope = null) {
   // removes a difference that costs nothing to erase.
   const upstreamBody = {
     model: targetModel,
-    messages: transformChatMessages(body.messages, originalToAlias, placeholderNote),
+    messages: transformChatMessages(body.messages, originalToAlias, placeholderNote, paramAliases),
     tools,
     stream: true,
     stream_options: { include_usage: true },
@@ -4549,6 +4626,8 @@ module.exports = {
   prepareToolParameters,
   restoreClientToolArguments,
   restoreToolCallArguments,
+  prepareToolCallArguments,
+  prepareMessageToolCallArguments,
   buildUpstreamPayload,
   isNewerVersion,
   checkAndApplyUpdate,

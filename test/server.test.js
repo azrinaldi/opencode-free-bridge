@@ -16,6 +16,8 @@ const {
   restoreClientToolName,
   restoreClientToolArguments,
   restoreToolCallArguments,
+  prepareToolCallArguments,
+  prepareMessageToolCallArguments,
   buildUpstreamHeaders,
   buildUpstreamPayload,
   getPersistentSessionId,
@@ -455,6 +457,84 @@ describe("server unit & integration tests", () => {
     assert.equal(restoreClientToolArguments("not json", aliases), "not json");
   });
 
+  it("rewrites client parameter names to wire aliases on outbound tool calls (multi-turn)", () => {
+    // Finding 1 fix: the gate inspects argument keys in prior assistant tool
+    // calls too. A client that sends back `old_string`/`new_string` in a
+    // follow-up turn must have them rewritten to the wire alias, or the next
+    // turn gets 429 again. The original `body.messages` must stay untouched so
+    // gate/protocol retries rebuild a fresh upstream payload.
+    const editTool = {
+      type: "function",
+      function: {
+        name: "edit",
+        description: "Replaces text.",
+        parameters: {
+          type: "object",
+          properties: {
+            old_string: { type: "string" },
+            new_string: { type: "string" },
+            path: { type: "string" },
+          },
+          required: ["old_string", "new_string", "path"],
+        },
+      },
+    };
+    const { paramAliases, originalToAlias } = prepareToolsWithFingerprint([editTool], false);
+    const aliases = paramAliases.get("edit");
+    assert.ok(aliases);
+
+    const call = {
+      function: { name: "edit", arguments: '{"old_string":"a","new_string":"b","path":"c"}' },
+    };
+    const prepared = prepareToolCallArguments(call, paramAliases, originalToAlias);
+    assert.notEqual(prepared, call, "a changed call is a fresh object");
+    assert.deepEqual(JSON.parse(prepared.function.arguments), {
+      old_text: "a",
+      new_text: "b",
+      path: "c",
+    });
+    assert.equal(call.function.arguments, '{"old_string":"a","new_string":"b","path":"c"}');
+
+    // A tool name that was itself aliased (run_code -> run_program) still
+    // resolves its parameter map through originalToAlias.
+    const both = prepareToolsWithFingerprint(
+      [{ ...editTool, function: { ...editTool.function, name: "run_code" } }],
+      false
+    );
+    const aliasedCall = {
+      function: { name: "run_code", arguments: '{"old_string":"x","path":"p"}' },
+    };
+    const aliasedPrepared = prepareToolCallArguments(
+      aliasedCall,
+      both.paramAliases,
+      both.originalToAlias
+    );
+    assert.deepEqual(JSON.parse(aliasedPrepared.function.arguments), { old_text: "x", path: "p" });
+
+    // A message with multiple calls prepares only those that need it, and the
+    // original message/array is never mutated.
+    const msgs = [
+      {
+        role: "assistant",
+        tool_calls: [
+          { function: { name: "edit", arguments: '{"old_string":"a","path":"p"}' } },
+          { function: { name: "other", arguments: '{"x":1}' } },
+        ],
+      },
+    ];
+    const preparedMsg = prepareMessageToolCallArguments(msgs[0], paramAliases, originalToAlias);
+    assert.deepEqual(JSON.parse(preparedMsg.tool_calls[0].function.arguments), {
+      old_text: "a",
+      path: "p",
+    });
+    assert.equal(preparedMsg.tool_calls[1], msgs[0].tool_calls[1]);
+    assert.equal(msgs[0].tool_calls[0].function.arguments, '{"old_string":"a","path":"p"}');
+    for (const bad of ['not json', '[]', 'null', '{"other":1}']) {
+      const c = { function: { name: "edit", arguments: bad } };
+      assert.equal(prepareToolCallArguments(c, paramAliases, originalToAlias), c);
+    }
+  });
+
   it("generates 10,000 session IDs using pooled random bytes in <25ms", () => {
     const t0 = process.hrtime.bigint();
     for (let i = 0; i < 10_000; i++) {
@@ -756,6 +836,65 @@ describe("server unit & integration tests", () => {
         .filter((a) => typeof a === "string" && a);
       assert.equal(respArgs.length, 1);
       assert.deepEqual(JSON.parse(respArgs[0]), { old_string: "x", new_string: "y" });
+    });
+
+    it("rewrites edit parameters in prior assistant tool calls on both payload lanes", async () => {
+      // End-to-end proof of the multi-turn fix: buildUpstreamPayload must rewrite
+      // `old_string`/`new_string` inside earlier assistant tool calls on both
+      // the Chat Completions and Responses lanes, without mutating the request.
+      const editTool = {
+        type: "function",
+        function: {
+          name: "edit",
+          description: "Replaces `old_string` with `new_string`.",
+          parameters: {
+            type: "object",
+            properties: {
+              old_string: { type: "string" },
+              new_string: { type: "string" },
+              path: { type: "string" },
+            },
+            required: ["old_string", "new_string", "path"],
+          },
+        },
+      };
+      const priorAssistant = {
+        role: "assistant",
+        tool_calls: [
+          {
+            id: "call_prev",
+            type: "function",
+            function: {
+              name: "edit",
+              arguments: '{"old_string":"a","new_string":"b","path":"f.txt"}',
+            },
+          },
+        ],
+      };
+      const body = {
+        model: "big-pickle",
+        messages: [priorAssistant, { role: "user", content: "continue" }],
+        tools: [editTool],
+      };
+      const original = JSON.stringify(body);
+
+      const chat = buildUpstreamPayload(body, "big-pickle", false).upstreamBody;
+      const chatCall = chat.messages
+        .flatMap((m) => m.tool_calls || [])
+        .find((tc) => tc.function?.name === "edit");
+      assert.deepEqual(JSON.parse(chatCall.function.arguments), {
+        old_text: "a",
+        new_text: "b",
+        path: "f.txt",
+      });
+      const resp = buildUpstreamPayload(body, "big-pickle", true).upstreamBody;
+      const fc = resp.input.find((i) => i.type === "function_call");
+      assert.deepEqual(JSON.parse(fc.arguments), {
+        old_text: "a",
+        new_text: "b",
+        path: "f.txt",
+      });
+      assert.equal(JSON.stringify(body), original, "the client request is not mutated");
     });
 
     it("automatically retries on the opposite protocol lane when upstream returns ModelProtocolUnsupported", async () => {

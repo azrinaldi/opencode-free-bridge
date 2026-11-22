@@ -1074,7 +1074,12 @@ It matters because omp, Cline, Roo and Aider declare `edit` with
 those keys as `old_text`/`new_text` and puts the client's names back into
 `tool_calls[].function.arguments`, both in streamed SSE (arguments are buffered
 per tool-call index because a JSON key can straddle two chunks) and in the
-folded JSON response, on both the Chat Completions and Responses lanes.
+folded JSON response, on both the Chat Completions and Responses lanes. The
+same rewrite runs in reverse on prior assistant tool calls in `messages[]` (and
+on Responses `input`), so a multi-turn agent that sends back `old_string` in
+turn 2 does not trip the gate again. The client's request body is never mutated:
+each upstream payload is built fresh from the original, so protocol fallback
+and gate retries see the same input.
 
 The bridge has appended the block since the fix in this release: it derives the
 working directory, workspace root, git-repo flag and platform from its own
