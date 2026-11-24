@@ -1,0 +1,3 @@
+# Local secrets and build context kept out of git.
+.env
+*.deb

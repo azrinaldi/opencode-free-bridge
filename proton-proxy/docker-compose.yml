@@ -1,0 +1,32 @@
+services:
+  proton-proxy:
+    build: .
+    image: proton-proxy:local
+    container_name: proton-proxy
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+    ports:
+      # Published on loopback only: OCB is the sole consumer.
+      - "127.0.0.1:18080:18080"
+    environment:
+      PROTON_DOMAIN: ${PROTON_DOMAIN}
+      PROTON_ENTRY_IP: ${PROTON_ENTRY_IP}
+      PROTON_PUBKEY: ${PROTON_PUBKEY}
+      KEYRING_FILE: /secrets/keyring.json
+      CERT_FILE: /secrets/cert.json
+      WG_PRIVATE_KEY: /secrets/wg-private.key
+    volumes:
+      - ${KEYRING_FILE}:/secrets/keyring.json:ro
+      - ${CERT_FILE}:/secrets/cert.json:ro
+      - ${WG_PRIVATE_KEY}:/secrets/wg-private.key:ro
+      - proton-state:/state
+    healthcheck:
+      test: ["CMD", "curl", "-s", "--max-time", "8", "https://ipv4.icanhazip.com"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  proton-state:
