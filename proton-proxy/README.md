@@ -26,10 +26,15 @@ cd proton-proxy
 cp .env.example .env
 # fill PROTON_DOMAIN, PROTON_ENTRY_IP, PROTON_PUBKEY from
 # ~/.local/share/freehop/logicals.json and rotate-state.json
+# fill KEYRING_FILE, CERT_FILE, WG_PRIVATE_KEY with the paths on THIS host
 docker compose up -d --build
 docker logs proton-proxy          # expect: AGENT STATUS state=Connected
 curl -x http://127.0.0.1:18080 https://ipv4.icanhazip.com
 ```
+
+`.env.example` ships placeholders only, so it is safe to keep in the
+repository. Fill in the real values in `.env`, which is git-ignored and never
+copied into the image.
 
 The proxy listens on `127.0.0.1:18080` on the host. Register it in OCB:
 

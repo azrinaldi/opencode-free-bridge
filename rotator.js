@@ -256,6 +256,50 @@ async function probeExitIp(probeUrl, timeoutMs = PROBE_TIMEOUT_MS, egressUrl = n
   }
 }
 
+/**
+ * Remove the operator's command from a text.
+ *
+ * Two shapes have to be covered: the `Command failed: <command line>` message
+ * that `execFile` builds, and any place where the command line appears
+ * verbatim inside the command's own output. The first keeps the program name
+ * (it tells the operator what failed); the second is dropped whole.
+ */
+function redactCommand(message) {
+  const text = String(message || "");
+  const marker = "Command failed:";
+  const at = text.indexOf(marker);
+  if (at === -1) return text.slice(0, 300);
+  const head = text.slice(0, at + marker.length);
+  const rest = text.slice(at + marker.length).trim();
+  const program = (rest.split(/\s+/)[0] || "").replace(/[^\w.\/-]/g, "");
+  return program ? `${head} ${program}` : head.trim();
+}
+
+/**
+ * Scrub a text that may repeat the command line.
+ *
+ * The command is where an operator keeps secrets (`warp-cli --token …`), and
+ * it can surface in three ways: as the `Command failed:` message, inside the
+ * command's own stdout, or inside its stderr. All three are redacted here, so
+ * the guarantee does not depend on which path the text took.
+ */
+function scrubCommandText(text, command) {
+  if (text === null || text === undefined) return text;
+  let out = redactCommand(text);
+  const cmd = String(command || "").trim();
+  if (cmd) {
+    out = out.split(cmd).join("<command>");
+    // The individual arguments are worth scrubbing too: an error message may
+    // quote only the flag and its value.
+    for (const arg of cmd.split(/\s+/)) {
+      if (arg.length < 8) continue;
+      if (/^--?[a-z0-9-]+$/i.test(arg)) continue;
+      out = out.split(arg).join("<redacted>");
+    }
+  }
+  return typeof out === "string" ? out.slice(0, 300) : out;
+}
+
 function runCommand(command, timeoutMs) {
   return new Promise((resolve) => {
     // execFile with shell: the command is operator-authored configuration, the
@@ -264,9 +308,9 @@ function runCommand(command, timeoutMs) {
     execFile(command, { shell: true, timeout: timeoutMs, windowsHide: true }, (err, stdout, stderr) => {
       resolve({
         ok: !err,
-        error: err ? String(err.message || err).slice(0, 300) : null,
-        output: String(stdout || "").slice(-500),
-        stderr: String(stderr || "").slice(-500),
+        error: err ? scrubCommandText(err.message || err, command) : null,
+        output: scrubCommandText(String(stdout || "").slice(-500), command),
+        stderr: scrubCommandText(String(stderr || "").slice(-500), command),
       });
     });
   });
@@ -341,9 +385,9 @@ async function rotate({ now = Date.now(), _probe = null, _run = runCommand, _con
           fromIp,
           toIp: null,
           skipped: null,
-          error: `Perintah rotasi gagal: ${run.error}`,
-          output: run.output,
-          stderr: run.stderr,
+          error: `Perintah rotasi gagal: ${scrubCommandText(run.error, cfg.command)}`,
+          output: scrubCommandText(run.output, cfg.command),
+          stderr: scrubCommandText(run.stderr, cfg.command),
           durationMs: Date.now() - started,
         };
       }

@@ -113,6 +113,55 @@ function displayHost(url) {
   }
 }
 
+/**
+ * Path for display: the home directory becomes `~`.
+ *
+ * The state path is echoed by the panel and by `/health`, so the absolute form
+ * published the operator's own username and home layout to every reader.
+ * `~/...` says the same thing to the operator and nothing to anyone else.
+ */
+function displayPath(filePath) {
+  const raw = String(filePath || "");
+  if (!raw) return raw;
+  const home = os.homedir();
+  if (home && raw.startsWith(home)) return `~${raw.slice(home.length)}`;
+  return raw;
+}
+
+/**
+ * Strip the userinfo from a URL so it can be shown or logged.
+ *
+ * Every surface that echoes an egress has to go through this: a raw proxy URL
+ * carries `user:pass@`, and any status document, event log or error string
+ * that repeats it verbatim publishes the proxy password to whoever can read
+ * that surface. `displayHost` is the stricter form (host:port only); this one
+ * keeps the scheme and path, because an upstream relay URL may need to be
+ * recognisable to be useful.
+ *
+ * A value that is not a URL is returned unchanged: the caller is redacting a
+ * URL, and mangling an opaque token would hide the very thing the operator
+ * needs to see.
+ */
+function redactUrl(url) {
+  if (!url) return url;
+  const raw = String(url);
+  try {
+    const u = new URL(raw);
+    if (!u.username && !u.password) return raw;
+    // Cut the userinfo out of the original string rather than rebuilding the
+    // URL from the parsed parts: `new URL(...).toString()` normalises the
+    // form (it appends a trailing slash to a bare origin), and the redacted
+    // string has to stay comparable with the other raw strings it is matched
+    // against.
+    const auth = `${u.username}${u.password ? `:${u.password}` : ""}@`;
+    const at = raw.indexOf(auth);
+    if (at === -1) return raw;
+    return raw.slice(0, at) + raw.slice(at + auth.length);
+  } catch {
+    return raw;
+  }
+}
+
 /** `id` for a URL that has none: stable across reloads, never leaks credentials. */
 function fallbackId(url) {
   const host = displayHost(url) || "proxy";
@@ -217,12 +266,41 @@ let cooldowns = { baseMs: DEFAULT_COOLDOWN_MS, maxMs: DEFAULT_MAX_COOLDOWN_MS };
 function keyOf(url) {
   return url ? url : "@direct";
 }
-/** Usage accounting gate: false skips an entry flagged `meter: false` in config. */
+/**
+ * Usage accounting gate: false skips an entry flagged `meter: false` in config.
+ */
 function shouldMeter(url) {
   const entry = url
     ? pool.entries.find((e) => e.url === url)
     : pool.entries.find((e) => e.direct);
   return entry ? entry.meter !== false : true;
+}
+
+/**
+ * Key for the usage map.
+ *
+ * The usage map used to be keyed by the raw proxy URL, which means the proxy
+ * password ended up in `usage.json` on disk and, worse, as a *key* in the
+ * `/health` document — a surface anyone can read without authentication. The
+ * key only has to be matchable, not readable, so it uses the redacted URL:
+ * two entries that differ only in credentials still share one counter, which
+ * is the right answer anyway since they are the same egress.
+ */
+function usageKeyOf(url) {
+  if (!url) return "@direct";
+  return redactUrl(url);
+}
+
+/**
+ * Label for a usage key, resolved against the pool.
+ *
+ * Mirrors `healthLabel`, but matches on the redacted key: the pool entry
+ * still holds the raw URL, so comparing the raw forms would never match.
+ */
+function usageLabel(key) {
+  if (key === "@direct") return "direct";
+  const entry = pool.entries.find((e) => usageKeyOf(e.url) === key);
+  return entry ? entry.label : null;
 }
 
 /** key -> { failures, cooldownUntil, lastError, lastOkAt, lastUsedAt } */
@@ -723,7 +801,7 @@ function describe(now = Date.now()) {
         : false,
     source: poolActive ? pool.source : current.source,
     locked: (poolActive ? pool.source : current.source) === "env",
-    configPath: configFile(),
+    configPath: displayPath(configFile()),
     error: current.error || pool.error || null,
     pool: poolView,
   };
@@ -918,7 +996,7 @@ function netFetch(url, init, egressUrl = null) {
           origRead().then((chunk) => {
             if (chunk && chunk.value && chunk.value.byteLength) {
               loadUsage();
-              const e = usageEntry(keyOf(egressUrl));
+              const e = usageEntry(usageKeyOf(egressUrl));
               e.responseBytes += chunk.value.byteLength;
               persistUsage();
             }
@@ -982,6 +1060,45 @@ function loadUsage() {
       if (json.day === new Date().toISOString().slice(0, 10)) usage = { day: json.day, perEgress: json.perEgress };
     }
   } catch {}
+  // Migrate keys written by an older release: they are raw proxy URLs, so they
+  // carry the proxy password in the file on disk and in every `/health`
+  // document that echoes them. Re-key them to the redacted form and rewrite
+  // the file, so an upgrade actually removes the leak instead of only
+  // stopping new writes from adding to it.
+  migrateUsageKeys();
+}
+
+/**
+ * Rewrite legacy raw-URL usage keys to the redacted form.
+ *
+ * Two legacy keys that differ only in credentials collapse into one, so their
+ * counters are summed rather than one overwriting the other.
+ */
+function migrateUsageKeys() {
+  let changed = false;
+  const migrated = {};
+  for (const [key, entry] of Object.entries(usage.perEgress || {})) {
+    const next = key === "@direct" ? key : redactUrl(key);
+    if (next === key) {
+      migrated[key] = entry;
+      continue;
+    }
+    changed = true;
+    if (migrated[next]) {
+      const target = migrated[next];
+      target.requests = (target.requests || 0) + (entry.requests || 0);
+      target.okRequests = (target.okRequests || 0) + (entry.okRequests || 0);
+      target.requestBytes = (target.requestBytes || 0) + (entry.requestBytes || 0);
+      target.responseBytes = (target.responseBytes || 0) + (entry.responseBytes || 0);
+      target.promptTokens = (target.promptTokens || 0) + (entry.promptTokens || 0);
+      target.completionTokens = (target.completionTokens || 0) + (entry.completionTokens || 0);
+    } else {
+      migrated[next] = entry;
+    }
+  }
+  if (!changed) return;
+  usage.perEgress = migrated;
+  persistUsage();
 }
 
 function persistUsage() {
@@ -999,7 +1116,7 @@ function recordUsage(egressUrl, requestBytes, responseBytes, { ok = false, promp
   // null/undefined means the direct entry; keyOf maps it to "@direct" so
   // direct traffic is accounted too, not silently dropped.
   loadUsage();
-  const e = usageEntry(keyOf(egressUrl));
+  const e = usageEntry(usageKeyOf(egressUrl));
   e.requests += 1;
   e.requestBytes += Math.max(0, Math.round(requestBytes) || 0);
   e.responseBytes += Math.max(0, Math.round(responseBytes) || 0);
@@ -1020,7 +1137,7 @@ function describeUsage() {
     const tokens = e.promptTokens + e.completionTokens;
     out.perEgress[key] = {
       ...e,
-      label: healthLabel(key),
+      label: usageLabel(key),
       totalMB: Math.round(mb * 100) / 100,
       tokensPerMB: mb > 0.01 ? Math.round(tokens / mb) : null,
     };
@@ -1238,6 +1355,8 @@ module.exports = {
   parsePoolEntry,
   parsePoolSpec,
   displayHost,
+  redactUrl,
+  displayPath,
   getProxyUrl,
   getPool: () => pool.entries.slice(),
   describe,

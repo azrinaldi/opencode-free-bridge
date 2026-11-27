@@ -566,7 +566,9 @@ identity sync, and the self-updater.
 - **Credentials:** `http://user:pass@host:port`, percent-encoded if they contain
   `@`, `:`, or `/`. They are stored in `~/.opencode-free-bridge/proxy.json`
   (mode `0600`) and never returned by the panel, `/api/proxy`, or `/health`;
-  those show `host:port` only.
+  those show `host:port` only. The same rule holds for the usage counters:
+  `usage.json` is keyed by the redacted URL, so the password is not in the
+  file and not in the `/health` document.
 - **Test before trusting it:** *Uji koneksi* fetches the models endpoint through
   the candidate proxy and reports the exit IP from `cdn-cgi/trace`. A 403 there
   means the proxy reaches upstream but its egress is refused.
@@ -742,7 +744,9 @@ passes through with upstream's `Retry-After`.
   restart, and the command string never appears in entries.
 - **Config:** `<state dir>/rotator.json`, mode `0600`. The command string is
   write-only: the panel, `/api/rotator` and `/health` report *that* one exists,
-  never *what* it is.
+  never *what* it is. That holds when the command fails too: the error text
+  keeps the program name and drops the command line and its arguments, so a
+  token in `WARP_ROTATE_CMD` cannot surface through `/health`.
 
 #### Tor circuit rotation
 

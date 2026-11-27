@@ -112,7 +112,11 @@ candidate and reports the exit IP; *Matikan proxy* returns to direct egress. No 
 - HTTP/HTTPS only. SOCKS5 is refused (Bun: `UnsupportedProxyProtocol`). TLS still comes from Bun,
   so `transport-baseline.json` stays valid.
 - Credentials persist in `~/.opencode-free-bridge/proxy.json` (mode `0600`) and are never returned
-  by the panel, `/api/proxy`, or `/health`.
+  by the panel, `/api/proxy`, or `/health`. Every surface that names an egress uses the redacted
+  form: `proxy.displayHost()` for `host:port`, `proxy.redactUrl()` for a URL, and
+  `proxy.displayPath()` for a state path (the home directory becomes `~`). The usage map in
+  `usage.json` is keyed by the redacted URL, and a file written by an older release is
+  re-keyed on load. Keep it that way: `/health` has no authentication.
 - API: `GET /api/proxy` (status), `POST /api/proxy` `{"url":"…"}` (set; `""` clears),
   `POST /api/proxy/test` `{"url":"…"}` (probe). Operator override: `UPSTREAM_PROXY_URL`, which
   locks the panel.
@@ -145,7 +149,9 @@ bridge can exchange a spent IP for a fresh one instead of passing the refusal to
   when a ≥2-entry pool is active (the pool walk already changes IP without a hop).
 - Status: `/health` → `egress.rotator`; manual hop: `POST /api/rotator {"rotate":true}`;
   config lives in `<state dir>/rotator.json` (mode `0600`); the command string is write-only and
-  never echoed by the panel, `/api/rotator`, or `/health`.
+  never echoed by the panel, `/api/rotator`, or `/health`. This holds on the failure path too:
+  `rotator.scrubCommandText()` strips the command line, and the command's own arguments, from
+  the error text, the stdout and the stderr that end up in `lastResult` and in the history.
 
 ### Current active free models (also supports family shorthands)
 
@@ -175,8 +181,8 @@ For a **reverse** tunnel (`-R`, the sending host dials out to the host that runs
 [Service]
 ExecStart=/usr/bin/ssh -NT -o BatchMode=yes -o ServerAliveInterval=15 \
   -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes \
-  -i /root/.ssh/id_vps_master -p 48222 \
-  -R 127.0.0.1:20136:127.0.0.1:20129 root@router-host
+  -i ~/.ssh/<your-key> -p <port> \
+  -R 127.0.0.1:20136:127.0.0.1:20129 <user>@<router-host>
 Restart=always
 RestartSec=5
 ```

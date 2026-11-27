@@ -3358,8 +3358,12 @@ function handleRequest(req, res) {
           let exhausted = false;
           quotaRecoveryStats.attempts += 1;
           const sessionHash = crypto.createHash("sha256").update(String(sessionId)).digest("hex").slice(0, 12);
+          // Host:port only. The raw egress URL carries `user:pass@`, and this
+          // event list is served by `/health`, which has no authentication —
+          // repeating the URL verbatim published the proxy password to anyone
+          // who could reach the port.
           const egressHost = egressState.egressUrl
-            ? String(egressState.egressUrl).replace(/^https?:\/\//, "").split("/")[0]
+            ? proxy.displayHost(egressState.egressUrl) || "direct"
             : (egressState.egress?.label || "direct");
           recordQuotaEvent({
             model: body.model,

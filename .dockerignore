@@ -4,3 +4,11 @@
 test/
 *.log
 .env
+# A nested .env is still a .env: the root rule alone did not keep
+# proton-proxy/.env out of the image, and `COPY . /x` bakes the build
+# context in wholesale.
+**/.env
+# Real env files are secret, the .example files are documentation and must
+# stay in the image.
+**/.env.*
+!**/.env.example
